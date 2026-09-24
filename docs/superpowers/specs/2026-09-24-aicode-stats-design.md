@@ -1,0 +1,267 @@
+# AI Coding 有效代码量统计工具（aicode）设计
+
+日期：2026-09-24
+
+## 1. 目标
+
+为 Claude Code、Codex CLI 等 AI 编码工具提供整机级实时统计：每次 git commit 时计算其中 **AI 生成且最终被提交的有效代码行数**，附带负责人、功能模块、commit 信息，汇总到本机全局存储，并通过可扩展的 `Reporter` 接口上报（默认空实现）。
+
+设计原则：**轻量**——零运行时依赖、无常驻进程、不阻塞 AI 工具和 git、不存代码原文。
+
+### 范围内
+- 本地 CLI `aicode`（TypeScript 编译为 JS，Node ≥ 18，npm 分发，仅使用 Node 内置模块）
+- Claude Code、Codex CLI 的钩子采集，覆盖文件编辑工具和 shell 工具
+- 全局 git hook 触发的 commit 统计
+- `Reporter` 扩展接口，默认 `NoopReporter`
+
+### 范围外（后续迭代）
+- HTTP 网关上报实现、失败重试队列
+- 服务端存储、看板、跨机器汇总
+- 工号 / LDAP 对接
+- rebase / squash / cherry-pick 后的归属迁移
+- prompt 存储、AI blame
+
+## 2. 借鉴 git-ai 的设计取舍
+
+参考开源项目 [git-ai](https://github.com/git-ai-project/git-ai)（Apache-2.0，Rust）的采集实现，逐项决定是否采纳：
+
+| git-ai 的做法 | 是否采纳 | 说明 |
+|---|---|---|
+| **Pre/Post 成对检查点**：`PreToolUse` 时记录文件当前状态作为基线，`PostToolUse` 时与基线对比，差异计为 AI 改动 | ✅ 采纳 | 不再依赖各工具的参数格式（`new_string`、`apply_patch` 等），统一对比文件的真实内容，比从工具参数里提取更准确。原设计中解析 Codex 会话日志 `FileChange` 的方案因此取消 |
+| **Shell 工具的快照对比**：执行 Bash 前后各做一次文件状态快照，找出被改动的文件 | ✅ 采纳（简化） | 补上原设计 3.2 节中"AI 用 shell 写文件"的漏计。git-ai 靠常驻进程加文件遍历实现；我们改用 `git status` 结合文件的 mtime/size，不引入常驻进程 |
+| **时间预算与规模上限**：遍历超过 1.5s 或文件超过 5 万个就放弃，整个钩子最长 4s | ✅ 采纳 | 保证大仓库下也不会拖慢 AI 工具 |
+| **默认忽略生成类文件**：lock 文件、`*.min.js`、`vendor/`、protobuf 生成代码，以及 `.gitattributes` 中标记为 `linguist-generated` 的文件 | ✅ 采纳 | 避免 AI 顺带更新 lock 文件，把 AI 代码量虚高几千行 |
+| **区分生成量和采纳量**：统计 AI 生成了多少行、其中多少行被原样提交 | ✅ 采纳 | 新增 `ai_generated` 指标，可以算出 AI 代码的采纳率 |
+| **按"工具/模型"拆分统计** | ✅ 采纳 | 从钩子输入或会话日志中读取模型名 |
+| **Codex 钩子安装细节**：需要开启 `[features].hooks = true`，并在 `[hooks.state]` 里写入 trusted_hash，否则 Codex 会等待用户在界面上手动信任钩子 | ✅ 采纳 | 这是安装能否成功的关键，第 8 节有具体实现 |
+| 常驻进程 | ❌ 不采纳 | 违背轻量原则 |
+| 按行号跟踪归属，并存进 git notes（`refs/notes/ai`） | ❌ 不采纳 | 实现很重（仅归属跟踪就有 2700 多行），而且 notes 会随 `git push` 同步到远端。我们在 commit 时用行指纹匹配，结果只存在本机 |
+| rebase / squash / stash 后迁移归属 | ❌ 暂不采纳 | 复杂度高，v1 只标记 amend |
+
+## 3. 核心口径
+
+**有效代码量 = 提交留存口径**：AI 工具每次调用前后对比文件内容，把新增的行记录为 AI 行指纹；commit 时，新增行中能匹配到指纹的计为 AI 行，其余计为人工行。AI 写入后又被人工改过的行，因指纹不匹配计为人工行。
+
+行归一化：
+1. 去掉首尾空白
+2. 跳过空行，以及只含 `{ } ( ) [ ] ; ,` 的行，这类行不计入任何一方
+3. 对归一化后的内容计算 `sha1`，取前 12 位十六进制作为指纹
+
+匹配键为 `(repo_id, 文件相对路径, 指纹)`。每条指纹记录只能被消费一次，从而正确处理重复行。
+
+"新增的行"按多重集合差计算：`added = multiset(改后行指纹) − multiset(改前行指纹)`。用多重集合而不是逐行 diff，实现简单，并且对行移动不敏感。
+
+## 4. 采集流程
+
+### 4.1 触发时机
+
+| 时刻 | 触发方式 | 动作 |
+|---|---|---|
+| AI 工具调用前 | Claude Code / Codex 的 `PreToolUse` 钩子 | `aicode hook pre --tool <claude\|codex>`：记录基线 |
+| AI 工具调用后 | Claude Code / Codex 的 `PostToolUse` 钩子 | `aicode hook post --tool <claude\|codex>`：与基线对比，把新增行的指纹写入 ledger |
+| git commit 完成后 | 全局 `post-commit` hook | 启动脱离父进程的后台子进程执行 `aicode commit`，hook 本身立即返回 |
+
+不设常驻进程和定时任务。
+
+钩子只匹配会改动文件的工具：
+
+| 工具 | 编辑类（路径已知） | Shell 类（路径未知） |
+|---|---|---|
+| Claude Code | `Write`、`Edit`、`MultiEdit`、`NotebookEdit` | `Bash` |
+| Codex | `apply_patch` | `exec_command`、`shell`、`shell_command`、`Bash`、`exec`、`multi_tool_use.parallel`（先去掉 `functions.` 前缀再匹配） |
+
+其他工具（Read、Grep 等）直接跳过，不做任何处理。
+
+### 4.2 编辑类工具
+
+- **pre**：从 `tool_input.file_path` 取得目标文件，读取当前内容并计算行指纹的多重集合，存为基线；文件不存在时基线为空
+- **post**：重新读取文件，与基线做多重集合差，得到新增行，写入 ledger
+- **基线丢失**（例如 pre 钩子执行失败）：退回到直接取 `tool_input` 中的 `new_string` / `content` 行
+
+### 4.3 Shell 类工具（含 Codex 的 `exec`）
+
+- **pre**：
+  1. 执行 `git status --porcelain=v1 -z --untracked-files=all`，得到已改动文件的集合
+  2. 对这些文件执行 `lstat`，记录 `(mtime, size)`
+  3. 对这些文件计算行指纹的多重集合，存为基线；超过 1MB 的文件跳过
+- **post**：
+  1. 再执行一次 `git status`
+  2. 找出"新出现的改动文件"和"`(mtime, size)` 发生变化的文件"
+  3. 对这些文件取基线：pre 时已是改动状态的，用 pre 存下的指纹；否则用 `git show HEAD:<path>` 的内容，新文件的基线为空
+  4. 与当前内容做多重集合差，得到新增行，写入 ledger
+- 已知误差：工具执行期间人工或其他会话对同一仓库的改动，会被算作 AI 改动（git-ai 也有同样的局限）
+
+### 4.4 基线的临时存储
+
+基线存放在 `~/.aicode/pending/<session_id>_<tool_use_id>.json`，post 读取后删除。超过 1 小时的 pending 文件在下次执行时清理。
+
+### 4.5 预算与上限
+
+- 单个钩子最长执行 2 秒，超时后放弃本次采集并以退出码 0 退出
+- `git status` 结果超过 5 万个文件时跳过 shell 快照
+- 单个文件超过 1MB 时不计算指纹
+- 忽略规则（见 6.2）命中的文件不采集
+
+### 4.6 模型识别
+
+- Codex：优先取钩子输入中的 `model`，没有时读取会话日志首行 `session_meta.payload.model`
+- Claude Code：从 `transcript_path` 文件末尾最多 64KB 中，找到最近一条 assistant 消息的 `message.model`
+- 识别失败时记为 `unknown`
+
+## 5. 存储（整机全局）
+
+```
+~/.aicode/
+├── config.json             # 全局配置
+├── ledger/<repo_key>.jsonl # 待匹配的 AI 行指纹，按仓库分文件
+├── pending/                # pre/post 之间的基线临时文件
+├── events.jsonl            # 全机所有项目的 commit 统计事件
+├── events.reported.jsonl   # 已上报事件的 event_id
+├── git-hooks/              # 全局 hooksPath 目录
+└── logs/aicode.log
+```
+
+- `repo_id`：取 origin remote 的 `host/group/project`；没有 remote 时为 `local:<仓库根目录绝对路径>`。`repo_key` 取 `repo_id` 的 sha1 前 16 位，用作文件名
+- ledger 每行一条记录：`{"p":"src/login.ts","f":"a1b2c3d4e5f6","t":"claude-code","m":"claude-opus-5-5","s":"<session>","ts":1727143200}`
+- 并发控制：`hook post` 只做追加写入（`O_APPEND`）；`commit` 改写 ledger 前先获取 `ledger/<repo_key>.lock`（用 `O_EXCL` 创建，超过 10 秒视为陈旧锁并接管）
+- 清理：`commit` 改写 ledger 时，丢弃超过 7 天仍未被消费的记录
+
+## 6. commit 统计
+
+### 6.1 CommitEvent（追加写入 `events.jsonl`）
+
+```json
+{
+  "event_id": "<repo_id>:<commit_sha>",
+  "repo": "gitlab.example.com/group/project",
+  "branch": "feature/login-v2",
+  "commit_sha": "...",
+  "parent_sha": "...",
+  "commit_message": "feat: 登录改版",
+  "committed_at": "2026-09-24T10:00:00+08:00",
+  "amend": false,
+  "owner": { "name": "...", "email": "..." },
+  "module": "user-center",
+  "stats": {
+    "added_total": 120,
+    "added_ai": 85,
+    "added_human": 35,
+    "deleted_total": 20,
+    "ai_ratio": 0.708,
+    "ai_generated": 110,
+    "ai_accept_rate": 0.773,
+    "by_tool": {
+      "claude-code/claude-opus-5-5": { "ai": 70, "generated": 90 },
+      "codex/gpt-5.6-luna": { "ai": 15, "generated": 20 }
+    }
+  },
+  "files": [
+    { "path": "src/login.ts", "module": "user-center", "added": 50, "ai": 40 }
+  ],
+  "client_version": "0.1.0"
+}
+```
+
+- `added_total` 只统计归一化后的有效行、且未被忽略规则命中的文件，等于 `added_ai + added_human`
+- `ai_generated`：统计开始时，ledger 中属于本次 commit 所涉及文件的记录总数；`ai_accept_rate = added_ai / ai_generated`。这是近似值：同一文件的 AI 改动如果分多次提交，未提交的部分也会被计入分母
+- `amend`：reflog 最新一条的信息以 `commit (amend)` 开头时为 true，由消费方决定是否去重
+- merge commit（有多个父提交）直接跳过
+- 二进制文件忽略；重命名的文件按新路径匹配
+- `owner`：优先取配置中的 `owner`，否则取 git 的 `user.name` / `user.email`
+- `module`：按配置中的 `modules` glob 映射逐个文件匹配，第一个命中的规则生效；都未命中时，分支名为 `feature/xxx` 或 `hotfix/xxx` 的取 `xxx`，否则为 `unknown`。commit 级的 `module` 取新增行最多的那个模块
+
+### 6.2 忽略规则
+
+内置默认规则（参考 git-ai），可在配置 `ignore` 中追加：
+
+```
+*.lock  package-lock.json  yarn.lock  pnpm-lock.yaml  go.sum  Gemfile.lock  poetry.lock
+composer.lock  Pipfile.lock  shrinkwrap.yaml  *.generated.*  *.min.js  *.min.css  *.map
+**/vendor/**  **/node_modules/**  **/__snapshots__/**  **/*.snap
+*.pb.go  *.pb.h  *.pb.cc  *_pb2.py  *_pb2_grpc.py  *.pb.swift  *.pb.dart
+```
+
+此外，仓库根目录 `.gitattributes` 中标记为 `linguist-generated` 的路径也一并忽略。
+
+## 7. 配置
+
+全局配置 `~/.aicode/config.json`，可被仓库根目录下的 `.aicode.json` 按顶层字段覆盖：
+
+```json
+{
+  "owner": { "name": "张三", "email": "zhangsan@example.com" },
+  "modules": [
+    { "path": "src/user/**", "name": "user-center" },
+    { "path": "src/order/**", "name": "order" }
+  ],
+  "ignore": ["docs/generated/**"],
+  "reporter": { "type": "noop", "module": "/path/to/my-reporter.js", "options": {} }
+}
+```
+
+- `reporter.type` 可选 `noop` 或 `module`；`module` 和 `options` 只在 `type` 为 `module` 时生效
+- glob 只支持 `**`、`*`、`?`，由内置的小函数转换为正则；不含 `/` 的模式匹配任意层级下的文件名
+
+## 8. Reporter 扩展接口
+
+```ts
+export interface Reporter {
+  name: string;
+  report(event: CommitEvent): Promise<void>;
+}
+// 自定义模块：export default (options: Record<string, unknown>) => Reporter
+```
+
+- 默认使用 `NoopReporter`，`report` 直接返回
+- `report` 成功后，把 `event_id` 追加到 `events.reported.jsonl`；失败时只写日志。每次执行 `aicode commit` 时，补发未上报的事件，每次最多 50 条
+- 以后接入 HTTP 网关：新增 `HttpReporter` 并注册为 `type: http`，其他代码不用改
+
+## 9. 安装：`aicode init`
+
+1. 创建 `~/.aicode/` 目录结构和默认 `config.json`
+2. **Claude Code**：在 `~/.claude/settings.json` 的 `hooks.PreToolUse` 和 `hooks.PostToolUse` 中各合并一条配置，`matcher` 为 `Write|Edit|MultiEdit|NotebookEdit|Bash`，命令分别为 `aicode hook pre --tool claude` 和 `aicode hook post --tool claude`。已存在则跳过
+3. **Codex**：修改 `~/.codex/config.toml`，修改前先备份为 `config.toml.aicode.bak`：
+   - 设置 `[features].hooks = true`，并删除旧的 `codex_hooks` 开关
+   - 在 `[hooks]` 的 `PreToolUse` 和 `PostToolUse` 下各追加一个不带 matcher 的 command 钩子，由 aicode 自己按工具名过滤
+   - 在 `[hooks.state]` 中写入信任记录，否则 Codex 会等待用户在界面上手动信任：
+     - key：`"<config.toml 绝对路径>:<pre_tool_use|post_tool_use>:<分组下标>:<钩子下标>"`
+     - value：`{ enabled = true, trusted_hash = "<hash>" }`
+     - hash 算法：`sha256(规范化 JSON {event_name, hooks:[{type:"command", async:false, command, timeout:600}]})`，其中规范化指按 key 排序
+   - TOML 读写：只做最小范围的文本追加和替换，不引入 TOML 库。**这一步实现时必须在真机上验证 Codex 能识别**
+4. `git config --global core.hooksPath ~/.aicode/git-hooks`；如果原来已经设置了全局 hooksPath，先记录下来，转发时调用它
+5. 在 `~/.aicode/git-hooks/` 下为所有标准 hook 生成转发脚本：先调用仓库自己的 `.git/hooks/<name>`（或原全局 hooksPath 下的同名 hook），并保留其退出码。`post-commit` 在转发之后额外启动 `aicode commit`
+
+提供 `aicode init --uninstall`，逆向恢复以上所有修改。
+
+## 10. 错误处理
+
+所有 `aicode` 子命令的异常都只写入 `~/.aicode/logs/aicode.log`，进程一律以退出码 0 退出，**绝不阻塞** AI 工具或 git。唯一例外是转发脚本透传仓库原有 hook 的退出码，以保证 `pre-commit` 等原有检查仍然生效。
+
+## 11. 代码结构
+
+```
+src/
+  cli.ts                 # 子命令分发：init / hook pre|post / commit
+  fingerprint.ts         # 行归一化、哈希、多重集合差
+  git.ts                 # 仓库根目录、repo_id、分支、status、diff 解析
+  ignore.ts              # 默认忽略规则、linguist-generated、glob 转正则
+  snapshot.ts            # pre/post 基线：编辑类与 shell 类
+  ledger.ts              # 追加写入、加锁、消费、清理
+  analyzer.ts            # diff × ledger → 统计
+  metadata.ts            # owner / module
+  config.ts              # 读取并合并 JSON 配置
+  reporter/index.ts      # 接口、注册表、noop、module 加载
+  agents/claude.ts       # 解析钩子输入、工具分类、模型识别
+  agents/codex.ts
+  installer/claude.ts
+  installer/codex.ts     # 含 trusted_hash 计算
+  installer/git.ts
+```
+
+## 12. 测试
+
+- 单元测试（vitest，仅作为开发依赖）：fingerprint 与多重集合差、diff 解析、ignore 匹配、ledger 消费计数与加锁、module 映射、config 合并、reporter 加载、Codex trusted_hash 计算
+- 钩子测试：以 Claude Code / Codex 的 Pre/Post 钩子 stdin 样本为 fixture，覆盖编辑类、shell 类、基线丢失、超时等场景
+- 集成测试：用临时 HOME 和临时 git 仓库，执行 `init` → 模拟 pre/post（含一次 shell 写文件）→ 人工修改部分行 → 真实 `git commit` → 断言 `events.jsonl` 中的 AI 行数、人工行数和 `ai_generated`，并验证仓库原有 hook 仍被调用
+- 真机验证：在本机 Claude Code 和 Codex（0.155.1）上各完成一次"AI 修改 → 提交"，核对统计结果
+- 性能：编辑类钩子 < 50ms；shell 类钩子在 1 万个文件的仓库中 < 300ms；包含 1000 行改动的 commit，统计耗时 < 1s
