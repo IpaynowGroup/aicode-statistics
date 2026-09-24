@@ -221,7 +221,7 @@ export interface Reporter {
 1. 创建 `~/.aicode/` 目录结构和默认 `config.json`
 2. **Claude Code**：在 `~/.claude/settings.json` 的 `hooks.PreToolUse` 和 `hooks.PostToolUse` 中各合并一条配置，`matcher` 为 `Write|Edit|MultiEdit|NotebookEdit|Bash`，命令分别为 `aicode hook pre --tool claude` 和 `aicode hook post --tool claude`。已存在则跳过
 3. **Codex**：修改 `~/.codex/config.toml`，修改前先备份为 `config.toml.aicode.bak`：
-   - 设置 `[features].hooks = true`，并删除旧的 `codex_hooks` 开关
+   - 设置 `[features].hooks = true`（已为 true 时不改动；原值为 false 时改为 true 并加 `# aicode` 标记，卸载时删除该行）
    - 在 `[hooks]` 的 `PreToolUse` 和 `PostToolUse` 下各追加一个不带 matcher 的 command 钩子，由 aicode 自己按工具名过滤
    - 在 `[hooks.state]` 中写入信任记录，否则 Codex 会等待用户在界面上手动信任：
      - key：`"<config.toml 绝对路径>:<pre_tool_use|post_tool_use>:<分组下标>:<钩子下标>"`
