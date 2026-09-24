@@ -9,7 +9,7 @@
 设计原则：**轻量**——零运行时依赖、无常驻进程、不阻塞 AI 工具和 git、不存代码原文。
 
 ### 范围内
-- 本地 CLI `aicode`（TypeScript 编译为 JS，Node ≥ 18，npm 分发，仅使用 Node 内置模块）
+- 本地 CLI `aicode`（TypeScript 编译为 JS，Node ≥ 18，npm 分发，仅使用 Node 内置模块；兼容 git ≥ 2.15）
 - Claude Code、Codex CLI 的钩子采集，覆盖文件编辑工具和 shell 工具
 - 全局 git hook 触发的 commit 统计
 - `Reporter` 扩展接口，默认 `NoopReporter`
@@ -68,7 +68,7 @@
 | 工具 | 编辑类（路径已知） | Shell 类（路径未知） |
 |---|---|---|
 | Claude Code | `Write`、`Edit`、`MultiEdit`、`NotebookEdit` | `Bash` |
-| Codex | `apply_patch` | `exec_command`、`shell`、`shell_command`、`Bash`、`exec`、`multi_tool_use.parallel`（先去掉 `functions.` 前缀再匹配） |
+| Codex | —（`apply_patch` 也按 shell 类处理，这样无需解析补丁格式） | `apply_patch`、`exec_command`、`shell`、`shell_command`、`Bash`、`exec`、`multi_tool_use.parallel`（先去掉 `functions.` 前缀再匹配） |
 
 其他工具（Read、Grep 等）直接跳过，不做任何处理。
 
@@ -123,7 +123,7 @@
 
 - `repo_id`：取 origin remote 的 `host/group/project`；没有 remote 时为 `local:<仓库根目录绝对路径>`。`repo_key` 取 `repo_id` 的 sha1 前 16 位，用作文件名
 - ledger 每行一条记录：`{"p":"src/login.ts","f":"a1b2c3d4e5f6","t":"claude-code","m":"claude-opus-5-5","s":"<session>","ts":1727143200}`
-- 并发控制：`hook post` 只做追加写入（`O_APPEND`）；`commit` 改写 ledger 前先获取 `ledger/<repo_key>.lock`（用 `O_EXCL` 创建，超过 10 秒视为陈旧锁并接管）
+- 并发控制：`hook post` 追加写入和 `commit` 改写 ledger，都要先获取 `ledger/<repo_key>.lock`（用 `O_EXCL` 创建，超过 10 秒视为陈旧锁并接管）。`commit` 是先写临时文件再 rename 替换，如果追加写入不加锁，期间追加的记录会丢失
 - 清理：`commit` 改写 ledger 时，丢弃超过 7 天仍未被消费的记录
 
 ## 6. commit 统计
@@ -185,7 +185,7 @@ composer.lock  Pipfile.lock  shrinkwrap.yaml  *.generated.*  *.min.js  *.min.css
 
 ## 7. 配置
 
-全局配置 `~/.aicode/config.json`，可被仓库根目录下的 `.aicode.json` 按顶层字段覆盖：
+全局配置 `~/.aicode/config.json`。仓库根目录下的 `.aicode.json` 只能覆盖 `owner`、`modules`、`ignore` 三个字段；**`reporter` 只从全局配置读取**，防止 clone 下来的恶意仓库借此执行任意代码：
 
 ```json
 {
@@ -232,6 +232,8 @@ export interface Reporter {
 5. 在 `~/.aicode/git-hooks/` 下为所有标准 hook 生成转发脚本：先调用仓库自己的 `.git/hooks/<name>`（或原全局 hooksPath 下的同名 hook），并保留其退出码。`post-commit` 在转发之后额外启动 `aicode commit`
 
 提供 `aicode init --uninstall`，逆向恢复以上所有修改。
+
+**已知限制**：在仓库级配置了 `core.hooksPath` 的仓库（例如使用 husky v5 及以上版本），仓库级配置会覆盖全局 hooksPath，`post-commit` 统计不会触发。v1 接受这一限制，并在文档中说明。
 
 ## 10. 错误处理
 
