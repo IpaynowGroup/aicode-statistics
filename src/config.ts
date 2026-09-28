@@ -4,7 +4,7 @@ import { logError } from './log.js';
 import { configPath } from './paths.js';
 
 export interface ModuleRule { path: string; name: string }
-export interface ReporterConfig { type: 'noop' | 'module'; module?: string; options?: Record<string, unknown> }
+export interface ReporterConfig { type: 'noop' | 'module' | 'mysql'; module?: string; options?: Record<string, unknown> }
 export interface AicodeConfig {
   owner?: { name?: string; email?: string };
   modules: ModuleRule[];

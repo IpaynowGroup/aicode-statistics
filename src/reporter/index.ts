@@ -17,8 +17,12 @@ export const noopReporter: Reporter = {
   },
 };
 
-/** type=module 时加载自定义模块，其默认导出为 (options) => Reporter */
+/** type=mysql 时动态加载 MySQL 实现；type=module 时加载自定义模块，其默认导出为 (options) => Reporter */
 export async function loadReporter(cfg: ReporterConfig): Promise<Reporter> {
+  if (cfg.type === 'mysql') {
+    const { createMysqlReporter } = await import('./mysql.js');
+    return createMysqlReporter(cfg.options ?? {});
+  }
   if (cfg.type !== 'module' || !cfg.module) return noopReporter;
   const mod = (await import(/* @vite-ignore */ pathToFileURL(cfg.module).href)) as {
     default: (options: Record<string, unknown>) => Reporter;
