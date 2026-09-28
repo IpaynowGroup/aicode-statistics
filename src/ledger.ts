@@ -7,6 +7,7 @@ export interface LedgerRecord { p: string; f: string; t: string; m: string; s: s
 
 const LOCK_STALE_MS = 10_000;
 const LOCK_WAIT_MS = 5_000;
+const APPEND_LOCK_WAIT_MS = 1_000; // 钩子路径受 2 秒预算约束
 
 export function ledgerFile(repoKey: string): string {
   return path.join(ledgerDir(), `${repoKey}.jsonl`);
@@ -16,10 +17,10 @@ function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-export function withLock<T>(repoKey: string, fn: () => T): T {
+export function withLock<T>(repoKey: string, fn: () => T, waitMs: number = LOCK_WAIT_MS): T {
   const lock = ledgerFile(repoKey) + '.lock';
   fs.mkdirSync(path.dirname(lock), { recursive: true });
-  const deadline = Date.now() + LOCK_WAIT_MS;
+  const deadline = Date.now() + waitMs;
   for (;;) {
     try {
       fs.writeFileSync(lock, String(process.pid), { flag: 'wx' });
@@ -81,5 +82,5 @@ export function appendRecords(repoKey: string, records: LedgerRecord[]): void {
   if (records.length === 0) return;
   withLock(repoKey, () => {
     fs.appendFileSync(ledgerFile(repoKey), records.map((r) => JSON.stringify(r) + '\n').join(''));
-  });
+  }, APPEND_LOCK_WAIT_MS);
 }

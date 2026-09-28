@@ -33,4 +33,14 @@ describe('ledger', () => {
     fs.utimesSync(ledgerFile('k') + '.lock', old, old);
     expect(withLock('k', () => 'ok')).toBe('ok');
   });
+
+  it('appendRecords 在钩子路径受限，1 秒超时不成功', () => {
+    fs.mkdirSync(path.dirname(ledgerFile('k')), { recursive: true });
+    fs.writeFileSync(ledgerFile('k') + '.lock', '999');
+    const start = Date.now();
+    expect(() => appendRecords('k', [rec('a')])).toThrow(/超时/);
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(2000);
+    fs.unlinkSync(ledgerFile('k') + '.lock');
+  });
 });
