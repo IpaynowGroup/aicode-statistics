@@ -4353,6 +4353,8 @@ export default (options) => ({
 });
 ```
 
+**Reporter 必须按 `event_id` 幂等**：在极少数情况下（例如上报成功后写"已上报"标记时磁盘出错），同一事件可能被再次上报，接收方需按 `event_id` 去重（内置 MySQL Reporter 通过主键 + `INSERT IGNORE` 保证）。
+
 ## 数据文件
 
 | 路径 | 内容 |
