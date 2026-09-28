@@ -4,7 +4,7 @@
 
 **Goal:** 实现一个零运行时依赖的 Node CLI `aicode`：通过 Claude Code / Codex 的 Pre/PostToolUse 钩子采集 AI 写入的行指纹，在全局 git `post-commit` 时计算每个 commit 的 AI 有效代码量，写入 `~/.aicode/events.jsonl`，并交给可扩展的 Reporter（默认空实现）。
 
-**Architecture:** 钩子阶段：pre 记录基线（编辑类记单文件指纹，shell 类记 `git status` 快照），post 做多重集合差，把新增行的指纹追加到按仓库分片的 ledger。commit 阶段：解析 `git show` 的新增行，逐行消费 ledger 中的指纹，得出 AI 行和人工行，补上负责人、模块信息后生成事件。安装器负责写入 Claude/Codex 钩子配置和全局 `core.hooksPath` 转发脚本。
+**Architecture:** 钩子阶段：pre 记录基线（编辑类记单文件指纹，shell 类记 `git status` 快照），post 做多重集合差，把新增行的指纹追加到按仓库分片的 ledger。commit 阶段：解析 `git show` 的新增行，逐行消费 ledger 中的指纹，得出 AI 行和人工行，补上负责人、模块信息后生成事件。安装器支持两种模式：全局模式（`~/.claude`、`~/.codex`、全局 `core.hooksPath`）和项目模式（仓库内的 `.claude/settings.local.json`、`.codex/config.toml`、`.git/hooks/post-commit`）；两种模式同时安装时，由钩子和 commit 两处的去重保证不会重复计数。
 
 **Tech Stack:** TypeScript 5（编译到 ES2022 / NodeNext ESM）、Node ≥ 18 内置模块、vitest（仅开发依赖）、git ≥ 2.15。
 
@@ -20,6 +20,8 @@
 - 仓库级 `.aicode.json` 只能覆盖 `owner` / `modules` / `ignore`，`reporter` 只从全局配置读取
 - 代码注释和用户提示用中文；commit message 格式为 `<type>: <中文描述>`，并以 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` 结尾
 - 直接在 `main` 分支提交（用户明确要求不拆分支）
+- `init` 写入任何文件前必须列出改动并经用户确认（`--yes` 可跳过）；非交互环境下没有 `--yes` 时中止；已存在的文件先备份为 `.aicode.bak`
+- 实现和测试过程中**不得修改用户真实的 `~/.claude`、`~/.codex` 或全局 git 配置**：测试一律通过 `tmpHome()` 隔离，真机安装只在 Task 15 征得用户同意后进行
 
 ## File Structure
 
@@ -46,10 +48,11 @@ src/
   reporter/index.ts # Reporter 接口、noop、module 加载、补发
   commit.ts         # commit 编排
   installer/shell.ts   # shell 引号与 aicode 命令拼接
-  installer/git.ts     # 全局 hooksPath 与转发脚本
-  installer/claude.ts  # ~/.claude/settings.json
-  installer/codex.ts   # ~/.codex/config.toml 与 trusted_hash
-  init.ts           # install / uninstall
+  installer/exclude.ts # .git/info/exclude 标记区块
+  installer/git.ts     # 全局 hooksPath 转发脚本 / 项目 post-commit
+  installer/claude.ts  # Claude settings（全局或项目文件）
+  installer/codex.ts   # Codex config.toml（全局或项目文件）、trusted_hash、项目信任检测
+  init.ts           # 全局 / 项目模式的安装与卸载计划
   cli.ts            # 入口
 tests/              # 与 src 同名的 *.test.ts，外加 helpers.ts 和 e2e.test.ts
 ```
@@ -58,7 +61,13 @@ tests/              # 与 src 同名的 *.test.ts，外加 helpers.ts 和 e2e.te
 
 ### Task 1: Codex 钩子真机探针（Spike）
 
-验证 spec 第 9 节和 4.1 节中尚未证实的三点：① Codex 能否识别我们写入的 `trusted_hash`，不用手动信任；② PostToolUse 的 stdin 字段有哪些；③ `apply_patch` 和 shell/exec 各自以什么 `tool_name` 触发钩子，以及钩子能否写入 `$HOME`（是否受沙箱限制）。探针使用临时 `CODEX_HOME`，**不修改用户真实配置**。
+验证 spec 9.3 节和 4.1 节中尚未证实的几点：
+1. **全局模式**：Codex 能否识别我们写入的 `trusted_hash`，而不需要用户手动信任
+2. **项目模式**：对已信任的项目，写在项目 `.codex/config.toml` 中的钩子能否生效；信任记录写在项目文件里（key 为项目配置文件的绝对路径）是否被识别
+3. PostToolUse 的 stdin 包含哪些字段；`apply_patch` 和 shell/exec 分别以什么 `tool_name` 触发钩子
+4. 钩子能否写入 `$HOME`，即是否受沙箱限制
+
+探针全程使用临时 `CODEX_HOME` 和临时仓库，**不修改用户真实配置**。每个场景会发起一次真实的 Codex 请求。
 
 **Files:**
 - Create: `scripts/probe-codex-hooks.mjs`
@@ -68,8 +77,8 @@ tests/              # 与 src 同名的 *.test.ts，外加 helpers.ts 和 e2e.te
 
 ```js
 // scripts/probe-codex-hooks.mjs
-// 一次性探针：验证 Codex hooks 的 trusted_hash、stdin 字段、tool_name，以及钩子能否写入 $HOME。
-// 使用临时 CODEX_HOME（只复制 auth.json），不会修改 ~/.codex/config.toml。
+// 一次性探针：验证 Codex 钩子的 trusted_hash（全局 / 项目级）、stdin 字段、tool_name，以及钩子能否写入 $HOME。
+// 每个场景使用独立的临时 CODEX_HOME（只复制 auth.json）和临时仓库，不会修改 ~/.codex。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -77,24 +86,8 @@ import crypto from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 
 const realCodexHome = process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
-const work = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'codex-probe-')));
-const codexHome = path.join(work, 'codex-home');
-const repo = path.join(work, 'repo');
-// 日志放在 $HOME 下，顺便验证钩子是否受沙箱限制
-const log = path.join(os.homedir(), `.aicode-probe-${Date.now()}.log`);
-fs.mkdirSync(codexHome);
-fs.mkdirSync(repo);
-fs.copyFileSync(path.join(realCodexHome, 'auth.json'), path.join(codexHome, 'auth.json'));
-
-const logger = path.join(work, 'logger.mjs');
-fs.writeFileSync(
-  logger,
-  `import fs from 'node:fs';let d='';process.stdin.on('data',c=>d+=c).on('end',()=>fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({phase:process.argv[2], input:d})+'\\n'));`,
-);
-
+const modelLine = (fs.readFileSync(path.join(realCodexHome, 'config.toml'), 'utf8').match(/^model\s*=\s*".*"$/m) ?? [''])[0];
 const q = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
-const cmd = (phase) => `${q(process.execPath)} ${q(logger)} ${phase}`;
-const configPath = path.join(codexHome, 'config.toml');
 const trustHash = (eventSnake, command) =>
   'sha256:' +
   crypto
@@ -102,12 +95,9 @@ const trustHash = (eventSnake, command) =>
     .update(JSON.stringify({ event_name: eventSnake, hooks: [{ async: false, command, timeout: 600, type: 'command' }] }))
     .digest('hex');
 
-const modelLine = (fs.readFileSync(path.join(realCodexHome, 'config.toml'), 'utf8').match(/^model\s*=\s*".*"$/m) ?? [''])[0];
-fs.writeFileSync(
-  configPath,
-  [
-    modelLine,
-    '',
+/** 钩子分组 + 信任记录；keyPath 为信任记录 key 中使用的配置文件路径 */
+function hooksToml(keyPath, cmd) {
+  return [
     '[features]',
     'hooks = true',
     '',
@@ -121,42 +111,75 @@ fs.writeFileSync(
     'type = "command"',
     `command = ${JSON.stringify(cmd('post'))}`,
     '',
-    `[hooks.state.${JSON.stringify(`${configPath}:pre_tool_use:0:0`)}]`,
+    `[hooks.state.${JSON.stringify(`${keyPath}:pre_tool_use:0:0`)}]`,
     'enabled = true',
     `trusted_hash = ${JSON.stringify(trustHash('pre_tool_use', cmd('pre')))}`,
     '',
-    `[hooks.state.${JSON.stringify(`${configPath}:post_tool_use:0:0`)}]`,
+    `[hooks.state.${JSON.stringify(`${keyPath}:post_tool_use:0:0`)}]`,
     'enabled = true',
     `trusted_hash = ${JSON.stringify(trustHash('post_tool_use', cmd('post')))}`,
     '',
-  ].join('\n'),
-);
-
-execFileSync('git', ['init', '-q'], { cwd: repo });
-const r = spawnSync(
-  'codex',
-  ['exec', '--full-auto', '--skip-git-repo-check', '-C', repo,
-   '请完成两步：1) 用 apply_patch 新建 a.txt，内容为 hello；2) 用 shell 命令 echo world > b.txt。不要做其他事。'],
-  { env: { ...process.env, CODEX_HOME: codexHome }, encoding: 'utf8', timeout: 300_000 },
-);
-console.log('codex exit:', r.status);
-if (r.status !== 0) console.log(String(r.stderr).slice(-2000));
-console.log('repo files:', fs.readdirSync(repo));
-const entries = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : [];
-console.log('hook calls:', entries.length);
-for (const e of entries) {
-  let o = {};
-  try { o = JSON.parse(e.input); } catch {}
-  console.log(e.phase, o.tool_name, Object.keys(o).join(','));
+  ].join('\n');
 }
-console.log('first payload:', entries[0]?.input.slice(0, 2000));
-console.log('workdir:', work, 'log:', log);
+
+function scenario(name, mode) {
+  const work = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `codex-probe-${name}-`)));
+  const codexHome = path.join(work, 'codex-home');
+  const repo = path.join(work, 'repo');
+  // 日志放在 $HOME 下，顺便验证钩子是否受沙箱限制
+  const log = path.join(os.homedir(), `.aicode-probe-${name}-${Date.now()}.log`);
+  fs.mkdirSync(codexHome);
+  fs.mkdirSync(repo);
+  fs.copyFileSync(path.join(realCodexHome, 'auth.json'), path.join(codexHome, 'auth.json'));
+  execFileSync('git', ['init', '-q'], { cwd: repo });
+
+  const logger = path.join(work, 'logger.mjs');
+  fs.writeFileSync(
+    logger,
+    `import fs from 'node:fs';let d='';process.stdin.on('data',c=>d+=c).on('end',()=>fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({phase:process.argv[2], input:d})+'\\n'));`,
+  );
+  const cmd = (phase) => `${q(process.execPath)} ${q(logger)} ${phase}`;
+
+  const globalConfig = path.join(codexHome, 'config.toml');
+  if (mode === 'global') {
+    fs.writeFileSync(globalConfig, `${modelLine}\n\n${hooksToml(globalConfig, cmd)}`);
+  } else {
+    // 项目模式：全局只声明信任该项目，钩子与信任记录都写在项目 .codex/config.toml
+    fs.writeFileSync(globalConfig, `${modelLine}\n\n[features]\nhooks = true\n\n[projects.${JSON.stringify(repo)}]\ntrust_level = "trusted"\n`);
+    const projectConfig = path.join(repo, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(projectConfig));
+    fs.writeFileSync(projectConfig, hooksToml(projectConfig, cmd));
+  }
+
+  const r = spawnSync(
+    'codex',
+    ['exec', '--full-auto', '--skip-git-repo-check', '-C', repo,
+     '请完成两步：1) 用 apply_patch 新建 a.txt，内容为 hello；2) 用 shell 命令 echo world > b.txt。不要做其他事。'],
+    { env: { ...process.env, CODEX_HOME: codexHome }, encoding: 'utf8', timeout: 300_000 },
+  );
+  console.log(`\n===== 场景 ${name} =====`);
+  console.log('codex exit:', r.status);
+  if (r.status !== 0 || /trust|review/i.test(String(r.stderr))) console.log(String(r.stderr).slice(-2000));
+  console.log('repo files:', fs.readdirSync(repo));
+  const entries = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : [];
+  console.log('hook calls:', entries.length);
+  for (const e of entries) {
+    let o = {};
+    try { o = JSON.parse(e.input); } catch {}
+    console.log(e.phase, o.tool_name, Object.keys(o).join(','));
+  }
+  console.log('first payload:', entries[0]?.input.slice(0, 2000));
+  console.log('workdir:', work, 'log:', log);
+}
+
+scenario('global', 'global');
+scenario('project', 'project');
 ```
 
 - [ ] **Step 2: 运行探针**
 
 Run: `node scripts/probe-codex-hooks.mjs`
-Expected：`repo files` 包含 `a.txt`、`b.txt`；`hook calls` ≥ 4（每次工具调用各一对 pre/post）；每行打印 `pre|post <tool_name> <字段列表>`。
+Expected：两个场景的 `repo files` 都包含 `a.txt` 和 `b.txt`（项目场景中还有 `.codex`）；`hook calls` ≥ 4；每行打印 `pre|post <tool_name> <字段列表>`。
 
 - [ ] **Step 3: 根据结果决策并记录**
 
@@ -164,12 +187,13 @@ Expected：`repo files` 包含 `a.txt`、`b.txt`；`hook calls` ≥ 4（每次�
 
 | 观察结果 | 结论与后续动作 |
 |---|---|
-| `hook calls` ≥ 4，且没有出现"hook 需要审核/信任"的提示 | trusted_hash 算法正确，Task 13 按原计划实现 |
-| `hook calls` 为 0，stderr 中出现 trust/review 相关字样 | trusted_hash 不匹配。**停止执行，把输出报告给用户**；需要对照 git-ai 的 `src/mdm/agents/codex.rs` 重新核对 |
-| `hook calls` 为 0，且没有任何提示 | `codex exec` 模式可能不运行钩子。把 Step 1 中的 prompt 改到交互模式下手动执行一次（`CODEX_HOME=<codexHome> codex -C <repo>`）；仍然为 0 就停止并报告 |
-| 日志文件没有生成，但 stderr 有权限错误 | 钩子运行在沙箱内，无法写入 $HOME。停止并报告用户，需要调整存储位置 |
-| 观察到的 `tool_name` 集合 | 如果有 Task 7 `classifyCodexTool` 列表之外的改文件工具名，就把它加进列表 |
-| stdin 字段中是否有 `tool_use_id`、`transcript_path`、`model` | 缺少 `tool_use_id` 时，Task 7 已退回用 `'unknown'`，此时同一会话的并行调用可能共用同一个 pending 文件，在笔记中注明 |
+| global 场景的 `hook calls` ≥ 4，且没有 trust/review 提示 | 全局 trusted_hash 算法正确，Task 13 按计划实现 |
+| global 场景的 `hook calls` 为 0，stderr 出现 trust/review 字样 | trusted_hash 不匹配。**停止执行，把输出报告给用户**，对照 git-ai 的 `src/mdm/agents/codex.rs` 重新核对 |
+| 两个场景的 `hook calls` 都为 0，且没有任何提示 | `codex exec` 模式可能不运行钩子。改用交互模式手动执行一次（`CODEX_HOME=<codexHome> codex -C <repo>`，输入同样的 prompt）；仍然为 0 就停止并报告 |
+| global 正常，project 场景的 `hook calls` 为 0 | 项目级信任记录的写法不对（可能需要写进全局文件，或 key 路径不同）。**停止并报告用户**，由用户决定：先只支持全局模式的 Codex，还是继续研究 |
+| 日志文件没有生成，但 stderr 有权限错误 | 钩子运行在沙箱内，无法写入 $HOME。停止并报告，需要调整存储位置 |
+| 观察到的 `tool_name` 集合 | 如果有 Task 7 `classifyCodexTool` 列表之外的改文件工具名，就加进列表 |
+| stdin 中是否有 `tool_use_id`、`transcript_path`、`model` | 缺少 `tool_use_id` 时，Task 8 会关闭"重复触发去重"，并以最后一次 pre 为准；在笔记中注明 |
 
 - [ ] **Step 4: 清理并提交**
 
@@ -1193,7 +1217,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
   - `readFingerprints(absPath: string): string[] | null`（文件不存在返回 `[]`；过大、二进制或不可读返回 `null`）
   - `captureEditBaseline(repoRoot: string, rel: string): EditBaseline | null`、`editChanges(b: EditBaseline): Change[]`
   - `captureShellBaseline(repoRoot: string, isIgnored: IgnoreFn, deadline: number): ShellBaseline | null`、`shellChanges(b: ShellBaseline, isIgnored: IgnoreFn, deadline: number): Change[]`
-  - `savePending(key: string, b: Baseline): void`、`takePending(key: string): Baseline | null`、`cleanupPending(maxAgeMs?: number): void`
+  - `savePending(key: string, b: Baseline): void`、`takePending(key: string): Baseline | null`（取出后把 pending 文件改名为 `.done` 标记）、`hasPending(key: string): boolean`、`isDone(key: string): boolean`、`cleanupPending(maxAgeMs?: number): void`（同时清理过期的 `.done`）
 
 - [ ] **Step 1: 编写失败测试**
 
@@ -1207,7 +1231,7 @@ import { buildIgnore } from '../src/ignore.js';
 import { pendingDir } from '../src/paths.js';
 import {
   BudgetExceeded, captureEditBaseline, captureShellBaseline, cleanupPending, editChanges, MAX_FILE_BYTES,
-  readFingerprints, savePending, shellChanges, takePending,
+  hasPending, isDone, readFingerprints, savePending, shellChanges, takePending,
 } from '../src/snapshot.js';
 import { commitAll, initRepo, tmpHome } from './helpers.js';
 
@@ -1274,14 +1298,18 @@ describe('shell 类基线', () => {
 
 describe('pending', () => {
   beforeEach(() => tmpHome());
-  it('save 后 take 一次即删除；cleanup 清理过期文件', () => {
-    savePending('claude-code_s/1_t:1', { kind: 'edit', repoRoot: '/r', rel: 'a', fps: [] });
-    expect(takePending('claude-code_s/1_t:1')).toEqual({ kind: 'edit', repoRoot: '/r', rel: 'a', fps: [] });
-    expect(takePending('claude-code_s/1_t:1')).toBeNull();
+  it('take 只能取一次并留下 .done 标记；cleanup 清理过期的 pending 与 .done', () => {
+    const key = 'claude-code_s/1_t:1';
+    savePending(key, { kind: 'edit', repoRoot: '/r', rel: 'a', fps: [] });
+    expect(hasPending(key)).toBe(true);
+    expect(isDone(key)).toBe(false);
+    expect(takePending(key)).toEqual({ kind: 'edit', repoRoot: '/r', rel: 'a', fps: [] });
+    expect(takePending(key)).toBeNull();
+    expect(hasPending(key)).toBe(false);
+    expect(isDone(key)).toBe(true);
     savePending('old', { kind: 'edit', repoRoot: '/r', rel: 'a', fps: [] });
-    const file = path.join(pendingDir(), fs.readdirSync(pendingDir())[0]);
     const old = new Date(Date.now() - 2 * 3600_000);
-    fs.utimesSync(file, old, old);
+    for (const name of fs.readdirSync(pendingDir())) fs.utimesSync(path.join(pendingDir(), name), old, old);
     cleanupPending();
     expect(fs.readdirSync(pendingDir())).toEqual([]);
   });
@@ -1400,11 +1428,24 @@ export function savePending(key: string, b: Baseline): void {
   fs.writeFileSync(pendingFile(key), JSON.stringify(b));
 }
 
+function doneFile(key: string): string {
+  return pendingFile(key).replace(/\.json$/, '.done');
+}
+
+export function hasPending(key: string): boolean {
+  return fs.existsSync(pendingFile(key));
+}
+
+export function isDone(key: string): boolean {
+  return fs.existsSync(doneFile(key));
+}
+
+/** 取出基线后改名为 .done，供重复触发的钩子识别"已处理" */
 export function takePending(key: string): Baseline | null {
   const file = pendingFile(key);
   try {
     const b = JSON.parse(fs.readFileSync(file, 'utf8')) as Baseline;
-    fs.unlinkSync(file);
+    fs.renameSync(file, doneFile(key));
     return b;
   } catch {
     return null;
@@ -1755,6 +1796,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: Task 3–7 的全部导出
 - Produces: `HOOK_BUDGET_MS = 2000`、`runHook(phase: Phase, agent: 'claude' | 'codex', raw: unknown): void`（pending key 为 `${agent}_${sessionId}_${toolUseId}`）
+- 去重规则（spec 4.4）：`toolUseId` 已知时，pre 在 `hasPending || isDone` 时跳过，post 在 `isDone` 时跳过；`toolUseId` 为 `'unknown'` 时不做去重，以最后一次 pre 为准
 
 - [ ] **Step 1: 编写失败测试**
 
@@ -1791,7 +1833,19 @@ describe('Claude 编辑类工具', () => {
     const recs = records(repo);
     expect(recs.map((r) => r.f)).toEqual(fingerprintText('new line 1\nnew line 2'));
     expect(recs[0]).toMatchObject({ p: 'a.ts', t: 'claude-code', m: 'claude-opus-5-5', s: 's1' });
-    expect(fs.readdirSync(pendingDir())).toEqual([]);
+    expect(fs.readdirSync(pendingDir()).every((n) => n.endsWith('.done'))).toBe(true);
+  });
+
+  it('同一次调用触发两遍钩子（全局 + 项目模式）时只记录一次', () => {
+    const repo = initRepo();
+    const file = path.join(repo, 'd.ts');
+    const raw = { session_id: 's', tool_use_id: 'dup', cwd: repo, tool_name: 'Write', tool_input: { file_path: file, content: 'x\ny\n' } };
+    runHook('pre', 'claude', raw);
+    runHook('pre', 'claude', raw);
+    fs.writeFileSync(file, 'x\ny\n');
+    runHook('post', 'claude', raw);
+    runHook('post', 'claude', raw);
+    expect(records(repo).map((r) => r.f)).toEqual(fingerprintText('x\ny'));
   });
 
   it('没有 pre 基线时退回使用 tool_input 文本', () => {
@@ -1870,8 +1924,8 @@ import { repoId, repoKey, repoRoot, repoRootForPath, toRepoRelative } from './gi
 import { buildIgnore, type IgnoreFn } from './ignore.js';
 import { appendRecords, type LedgerRecord } from './ledger.js';
 import {
-  captureEditBaseline, captureShellBaseline, cleanupPending, editChanges, savePending, shellChanges, takePending,
-  type Baseline, type Change,
+  captureEditBaseline, captureShellBaseline, cleanupPending, editChanges, hasPending, isDone, savePending, shellChanges,
+  takePending, type Baseline, type Change,
 } from './snapshot.js';
 
 export const HOOK_BUDGET_MS = 2000;
@@ -1881,14 +1935,18 @@ export function runHook(phase: Phase, agent: 'claude' | 'codex', raw: unknown): 
   if (input.toolClass === 'skip') return;
   const deadline = Date.now() + HOOK_BUDGET_MS;
   const key = `${input.agent}_${input.sessionId}_${input.toolUseId}`;
+  // 全局与项目模式同时安装时，同一次调用会触发两遍钩子；tool_use_id 未知时无法区分调用，不去重
+  const dedupe = input.toolUseId !== 'unknown';
 
   if (phase === 'pre') {
     cleanupPending();
+    if (dedupe && (hasPending(key) || isDone(key))) return;
     const baseline = input.toolClass === 'edit' ? editBaseline(input) : shellBaseline(input, deadline);
     if (baseline) savePending(key, baseline);
     return;
   }
 
+  if (dedupe && isDone(key)) return;
   const baseline = takePending(key);
   const changes = input.toolClass === 'edit' ? editPost(input, baseline) : shellPost(baseline, deadline);
   if (changes.length) record(input, changes);
@@ -2432,6 +2490,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 **Interfaces:**
 - Consumes: git.ts、ledger.ts、analyzer.ts、metadata.ts、events.ts、reporter、config.ts、ignore.ts、`VERSION`
 - Produces: `LEDGER_TTL_SECONDS = 604800`、`runCommit(cwd: string): Promise<CommitEvent | null>`（非仓库、merge commit 或已统计过时返回 null）
+- 判重、统计、写 ledger、写事件都在同一把 ledger 锁内完成：全局与项目模式各触发一次 `aicode commit` 时，第二个进程会在锁内看到事件已存在并返回 null
 
 - [ ] **Step 1: 编写失败测试**
 
@@ -2538,7 +2597,6 @@ export async function runCommit(cwd: string): Promise<CommitEvent | null> {
   if (info.parents.length > 1) return null; // merge commit 不统计
   const id = repoId(root);
   const eventId = `${id}:${info.sha}`;
-  if (hasEvent(eventId)) return null;
 
   const config = loadConfig(root);
   const branch = currentBranch(root);
@@ -2547,29 +2605,33 @@ export async function runCommit(cwd: string): Promise<CommitEvent | null> {
   const diffs = commitDiff(root, info.sha);
   const key = repoKey(id);
 
-  const result = withLock(key, () => {
+  const amend = isAmend(root);
+  const owner = resolveOwner(config, { name: info.authorName, email: info.authorEmail });
+
+  const event = withLock(key, (): CommitEvent | null => {
+    if (hasEvent(eventId)) return null; // 在锁内判重，避免两个进程同时统计
     const r = analyzeCommit(diffs, readRecords(key), isIgnored, moduleOf);
     const cutoff = Math.floor(Date.now() / 1000) - LEDGER_TTL_SECONDS;
     writeRecords(key, r.remaining.filter((rec) => rec.ts >= cutoff));
-    return r;
+    const e: CommitEvent = {
+      event_id: eventId,
+      repo: id,
+      branch,
+      commit_sha: info.sha,
+      parent_sha: info.parents[0] ?? null,
+      commit_message: info.message,
+      committed_at: info.committedAt,
+      amend,
+      owner,
+      module: commitModule(r.files),
+      stats: r.stats,
+      files: r.files,
+      client_version: VERSION,
+    };
+    appendEvent(e);
+    return e;
   });
-
-  const event: CommitEvent = {
-    event_id: eventId,
-    repo: id,
-    branch,
-    commit_sha: info.sha,
-    parent_sha: info.parents[0] ?? null,
-    commit_message: info.message,
-    committed_at: info.committedAt,
-    amend: isAmend(root),
-    owner: resolveOwner(config, { name: info.authorName, email: info.authorEmail }),
-    module: commitModule(result.files),
-    stats: result.stats,
-    files: result.files,
-    client_version: VERSION,
-  };
-  appendEvent(event);
+  if (!event) return null;
   await flushEvents(await loadReporter(config.reporter));
   return event;
 }
@@ -2591,17 +2653,20 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 12: 全局 git hook 安装器
+### Task 12: git hook 安装器（全局与项目）及 exclude 工具
 
 **Files:**
-- Create: `src/installer/shell.ts`, `src/installer/git.ts`
+- Modify: `src/git.ts`（新增 `gitCommonDir`、`isTracked`、`localHooksPath`）
+- Create: `src/installer/shell.ts`, `src/installer/exclude.ts`, `src/installer/git.ts`
 - Test: `tests/installer-git.test.ts`
 
 **Interfaces:**
-- Consumes: `gitHooksDir()`、`installStatePath()`、`tryGit`
+- Consumes: `gitHooksDir()`、`installStatePath()`、`git`、`tryGit`
 - Produces:
-  - `shell.ts`：`shq(s: string): string`、`cliPath(): string`、`aicodeCommand(args: string): string`（形如 `'<node>' '<cli>' <args>`，使用绝对路径，避免 nvm 等环境下 PATH 不可用）
-  - `git.ts`：`HOOK_NAMES: string[]`、`renderForwarder(name: string, prevHooksPath: string | null, commitCommand: string): string`、`installGitHooks(): void`、`uninstallGitHooks(): void`
+  - `git.ts` 新增：`gitCommonDir(repo: string): string`（绝对路径）、`isTracked(repo: string, rel: string): boolean`、`localHooksPath(repo: string): string | null`
+  - `shell.ts`：`shq(s: string): string`、`cliPath(): string`、`aicodeCommand(args: string): string`（形如 `'<node>' '<cli>' <args>`）
+  - `exclude.ts`：`addExclude(repo: string, patterns: string[]): void`、`removeExclude(repo: string): void`
+  - `installer/git.ts`：`HOOK_NAMES: string[]`、`renderForwarder(name: string, prevHooksPath: string | null, commitCommand: string): string`、`installGitHooks(): void`、`uninstallGitHooks(): void`、`projectHookPath(repo: string): string`、`renderProjectPostCommit(origPath: string, commitCommand: string): string`、`installProjectGitHook(repo: string): void`、`uninstallProjectGitHook(repo: string): void`
 
 - [ ] **Step 1: 编写失败测试**
 
@@ -2611,9 +2676,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { installGitHooks, renderForwarder, uninstallGitHooks } from '../src/installer/git.js';
+import { gitCommonDir, isTracked, localHooksPath } from '../src/git.js';
+import { addExclude, removeExclude } from '../src/installer/exclude.js';
+import {
+  installGitHooks, installProjectGitHook, projectHookPath, renderForwarder, uninstallGitHooks, uninstallProjectGitHook,
+} from '../src/installer/git.js';
 import { gitHooksDir } from '../src/paths.js';
-import { initRepo, sh, tmpHome } from './helpers.js';
+import { commitAll, initRepo, sh, tmpHome } from './helpers.js';
 
 let home: string;
 beforeEach(() => {
@@ -2627,14 +2696,44 @@ const globalHooksPath = () => {
   }
 };
 
-describe('renderForwarder', () => {
+describe('git 辅助函数', () => {
+  it('gitCommonDir / isTracked / localHooksPath', () => {
+    const repo = initRepo();
+    expect(gitCommonDir(repo)).toBe(path.join(repo, '.git'));
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+    commitAll(repo, 'init');
+    expect(isTracked(repo, 'a.txt')).toBe(true);
+    expect(isTracked(repo, 'b.txt')).toBe(false);
+    expect(localHooksPath(repo)).toBeNull();
+    sh(repo, ['config', 'core.hooksPath', '.husky/_']);
+    expect(localHooksPath(repo)).toBe('.husky/_');
+  });
+});
+
+describe('exclude', () => {
+  it('写入标记区块，重复写入幂等，移除后还原', () => {
+    const repo = initRepo();
+    const file = path.join(repo, '.git', 'info', 'exclude');
+    const original = fs.readFileSync(file, 'utf8');
+    addExclude(repo, ['/.claude/settings.local.json']);
+    addExclude(repo, ['/.claude/settings.local.json', '/.codex/config.toml']);
+    const text = fs.readFileSync(file, 'utf8');
+    expect(text.match(/# >>> aicode >>>/g)).toHaveLength(1);
+    expect(text).toContain('/.codex/config.toml');
+    fs.mkdirSync(path.join(repo, '.codex'));
+    fs.writeFileSync(path.join(repo, '.codex', 'config.toml'), 'x\n');
+    expect(sh(repo, ['status', '--porcelain'])).toBe('');
+    removeExclude(repo);
+    expect(fs.readFileSync(file, 'utf8')).toBe(original);
+  });
+});
+
+describe('全局模式', () => {
   it('只有 post-commit 会额外在后台启动统计', () => {
     expect(renderForwarder('post-commit', null, "'node' 'cli' commit")).toContain("( 'node' 'cli' commit </dev/null >/dev/null 2>&1 & )");
     expect(renderForwarder('pre-commit', null, "'node' 'cli' commit")).not.toContain('commit </dev/null');
   });
-});
 
-describe('installGitHooks', () => {
   it('设置全局 hooksPath，转发到仓库自有 hook 并保留其退出码', () => {
     installGitHooks();
     expect(globalHooksPath()).toBe(gitHooksDir());
@@ -2653,7 +2752,7 @@ describe('installGitHooks', () => {
     fs.mkdirSync(prev);
     execFileSync('git', ['config', '--global', 'core.hooksPath', prev], { cwd: home });
     installGitHooks();
-    installGitHooks(); // 重复安装不会把自身记成"原路径"
+    installGitHooks(); // 重复安装时不会把自身记为原路径
     expect(fs.readFileSync(path.join(gitHooksDir(), 'pre-commit'), 'utf8')).toContain(prev);
     uninstallGitHooks();
     expect(globalHooksPath()).toBe(prev);
@@ -2666,14 +2765,58 @@ describe('installGitHooks', () => {
     expect(fs.existsSync(gitHooksDir())).toBe(false);
   });
 });
+
+describe('项目模式', () => {
+  it('保留并调用原有 post-commit，可重复安装，卸载后还原', () => {
+    const repo = initRepo();
+    const hook = projectHookPath(repo);
+    const marker = path.join(repo, '..', `marker-${path.basename(repo)}`);
+    const original = `#!/bin/sh\necho ran > '${marker}'\n`;
+    fs.writeFileSync(hook, original, { mode: 0o755 });
+    installProjectGitHook(repo);
+    installProjectGitHook(repo);
+    expect(fs.readFileSync(hook + '.aicode-orig', 'utf8')).toBe(original);
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+    commitAll(repo, 'init');
+    expect(fs.existsSync(marker)).toBe(true);
+    uninstallProjectGitHook(repo);
+    expect(fs.readFileSync(hook, 'utf8')).toBe(original);
+    expect(fs.existsSync(hook + '.aicode-orig')).toBe(false);
+  });
+
+  it('原来没有 post-commit 时，卸载后删除', () => {
+    const repo = initRepo();
+    installProjectGitHook(repo);
+    expect(fs.readFileSync(projectHookPath(repo), 'utf8')).toContain('# aicode project post-commit');
+    uninstallProjectGitHook(repo);
+    expect(fs.existsSync(projectHookPath(repo))).toBe(false);
+  });
+});
 ```
 
 - [ ] **Step 2: 运行测试，确认失败**
 
 Run: `npx vitest run tests/installer-git.test.ts`
-Expected: FAIL，提示无法解析模块
+Expected: FAIL，提示无法解析模块或导出不存在
 
-- [ ] **Step 3: 实现 installer/shell.ts**
+- [ ] **Step 3: 在 src/git.ts 末尾追加辅助函数**
+
+```ts
+export function gitCommonDir(repo: string): string {
+  return path.resolve(repo, git(repo, ['rev-parse', '--git-common-dir']).trim());
+}
+
+export function isTracked(repo: string, rel: string): boolean {
+  return tryGit(repo, ['ls-files', '--error-unmatch', rel]) !== null;
+}
+
+/** 仓库级 core.hooksPath（如 husky），存在时全局与项目模式的 hook 都不会被 git 调用 */
+export function localHooksPath(repo: string): string | null {
+  return tryGit(repo, ['config', '--local', '--get', 'core.hooksPath'])?.trim() || null;
+}
+```
+
+- [ ] **Step 4: 实现 installer/shell.ts**
 
 ```ts
 import { fileURLToPath } from 'node:url';
@@ -2694,14 +2837,47 @@ export function aicodeCommand(args: string): string {
 }
 ```
 
-- [ ] **Step 4: 实现 installer/git.ts**
+- [ ] **Step 5: 实现 installer/exclude.ts**
+
+```ts
+import fs from 'node:fs';
+import path from 'node:path';
+import { gitCommonDir } from '../git.js';
+
+// .gitignore 语法不支持行尾注释，所以用首尾标记行包住 aicode 写入的条目
+const BEGIN = '# >>> aicode >>>';
+const END = '# <<< aicode <<<';
+
+function excludeFile(repo: string): string {
+  return path.join(gitCommonDir(repo), 'info', 'exclude');
+}
+
+function strip(text: string): string {
+  return text.replace(new RegExp(`${BEGIN}\\n[\\s\\S]*?${END}\\n`, 'g'), '');
+}
+
+export function addExclude(repo: string, patterns: string[]): void {
+  const file = excludeFile(repo);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  let text = fs.existsSync(file) ? strip(fs.readFileSync(file, 'utf8')) : '';
+  if (text.length && !text.endsWith('\n')) text += '\n';
+  fs.writeFileSync(file, `${text}${BEGIN}\n${patterns.join('\n')}\n${END}\n`);
+}
+
+export function removeExclude(repo: string): void {
+  const file = excludeFile(repo);
+  if (fs.existsSync(file)) fs.writeFileSync(file, strip(fs.readFileSync(file, 'utf8')));
+}
+```
+
+- [ ] **Step 6: 实现 installer/git.ts**
 
 ```ts
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { tryGit } from '../git.js';
+import { gitCommonDir, tryGit } from '../git.js';
 import { gitHooksDir, installStatePath } from '../paths.js';
 import { aicodeCommand, shq } from './shell.js';
 
@@ -2710,6 +2886,10 @@ export const HOOK_NAMES = [
   'commit-msg', 'post-commit', 'pre-rebase', 'post-checkout', 'post-merge', 'pre-push', 'post-rewrite',
   'pre-auto-gc', 'push-to-checkout', 'sendemail-validate', 'reference-transaction',
 ];
+const PROJECT_MARK = '# aicode project post-commit';
+const backgroundCommit = (commitCommand: string): string => `( ${commitCommand} </dev/null >/dev/null 2>&1 & )`;
+
+// ---------- 全局模式 ----------
 
 interface InstallState { prevHooksPath: string | null }
 
@@ -2749,7 +2929,7 @@ export function renderForwarder(name: string, prevHooksPath: string | null, comm
     'status=0',
     'if [ -x "$TARGET" ]; then "$TARGET" "$@"; status=$?; fi',
   ];
-  if (name === 'post-commit') lines.push(`( ${commitCommand} </dev/null >/dev/null 2>&1 & )`);
+  if (name === 'post-commit') lines.push(backgroundCommit(commitCommand));
   lines.push('exit $status');
   return lines.join('\n') + '\n';
 }
@@ -2779,18 +2959,60 @@ export function uninstallGitHooks(): void {
   fs.rmSync(gitHooksDir(), { recursive: true, force: true });
   fs.rmSync(installStatePath(), { force: true });
 }
+
+// ---------- 项目模式 ----------
+
+export function projectHookPath(repo: string): string {
+  return path.join(gitCommonDir(repo), 'hooks', 'post-commit');
+}
+
+export function renderProjectPostCommit(origPath: string, commitCommand: string): string {
+  return [
+    '#!/bin/sh',
+    PROJECT_MARK,
+    `ORIG=${shq(origPath)}`,
+    'status=0',
+    'if [ -x "$ORIG" ]; then "$ORIG" "$@"; status=$?; fi',
+    backgroundCommit(commitCommand),
+    'exit $status',
+  ].join('\n') + '\n';
+}
+
+function isAicodeHook(file: string): boolean {
+  try {
+    return fs.readFileSync(file, 'utf8').includes(PROJECT_MARK);
+  } catch {
+    return false;
+  }
+}
+
+export function installProjectGitHook(repo: string): void {
+  const hook = projectHookPath(repo);
+  const orig = hook + '.aicode-orig';
+  fs.mkdirSync(path.dirname(hook), { recursive: true });
+  if (fs.existsSync(hook) && !isAicodeHook(hook) && !fs.existsSync(orig)) fs.renameSync(hook, orig);
+  fs.writeFileSync(hook, renderProjectPostCommit(orig, aicodeCommand('commit')));
+  fs.chmodSync(hook, 0o755);
+}
+
+export function uninstallProjectGitHook(repo: string): void {
+  const hook = projectHookPath(repo);
+  const orig = hook + '.aicode-orig';
+  if (isAicodeHook(hook)) fs.unlinkSync(hook);
+  if (fs.existsSync(orig)) fs.renameSync(orig, hook);
+}
 ```
 
-- [ ] **Step 5: 运行测试，确认通过**
+- [ ] **Step 7: 运行测试，确认通过**
 
-Run: `npx vitest run tests/installer-git.test.ts`
+Run: `npx vitest run tests/installer-git.test.ts tests/git.test.ts`
 Expected: PASS
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 8: 提交**
 
 ```bash
-git add src/installer/shell.ts src/installer/git.ts tests/installer-git.test.ts
-git commit -m "feat: 实现全局 git hook 转发安装与卸载
+git add src/git.ts src/installer tests/installer-git.test.ts
+git commit -m "feat: 实现全局与项目模式的 git hook 安装及 exclude 工具
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2799,17 +3021,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 13: Claude Code 与 Codex 钩子安装器
 
+两个安装器都以**目标文件路径**作为参数，全局模式和项目模式共用同一套实现。开始前先确认 Task 1 的结论：全局和项目两个场景的 trusted_hash 都被 Codex 识别。
+
 **Files:**
 - Create: `src/installer/claude.ts`, `src/installer/codex.ts`
 - Test: `tests/installer-agents.test.ts`
 
 **Interfaces:**
-- Consumes: `claudeSettingsPath()`、`codexHome()`、`aicodeCommand`
+- Consumes: `codexHome()`、`aicodeCommand`
 - Produces:
-  - `claude.ts`：`CLAUDE_MATCHER = 'Write|Edit|MultiEdit|NotebookEdit|Bash'`、`isAicodeClaudeCommand(cmd: string): boolean`、`installClaude(): void`、`uninstallClaude(): void`
-  - `codex.ts`：`codexTrustHash(eventSnake: string, command: string): string`、`applyCodexInstall(text: string, configPath: string, preCmd: string, postCmd: string): string`、`removeCodexInstall(text: string): string`、`installCodex(): void`、`uninstallCodex(): void`
-
-实现 trusted_hash 前，先确认 Task 1 的探针结论为"trusted_hash 算法正确"。
+  - `claude.ts`：`CLAUDE_MATCHER = 'Write|Edit|MultiEdit|NotebookEdit|Bash'`、`isAicodeClaudeCommand(cmd: string): boolean`、`installClaude(settingsFile: string): void`、`uninstallClaude(settingsFile: string): void`
+  - `codex.ts`：`codexTrustHash(eventSnake: string, command: string): string`、`applyCodexInstall(text: string, configPath: string, preCmd: string, postCmd: string): string`、`removeCodexInstall(text: string): string`、`installCodex(configFile: string): void`、`uninstallCodex(configFile: string): void`、`isCodexTrusted(repoRoot: string): boolean`
+- 卸载约定：卸载后文件内容为空（Claude 为 `{}`，Codex 为空白），**且没有 `.aicode.bak` 备份**（说明文件是 aicode 创建的），就删除该文件
 
 - [ ] **Step 1: 编写失败测试**
 
@@ -2820,34 +3043,43 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { installClaude, isAicodeClaudeCommand, uninstallClaude } from '../src/installer/claude.js';
-import { applyCodexInstall, codexTrustHash, removeCodexInstall } from '../src/installer/codex.js';
+import {
+  applyCodexInstall, codexTrustHash, installCodex, isCodexTrusted, removeCodexInstall, uninstallCodex,
+} from '../src/installer/codex.js';
 import { claudeSettingsPath } from '../src/paths.js';
 import { tmpHome } from './helpers.js';
 
-beforeEach(() => tmpHome());
+let home: string;
+beforeEach(() => {
+  home = tmpHome();
+});
 
 describe('Claude 安装器', () => {
   it('保留用户原有钩子，可重复安装，卸载后还原', () => {
+    const file = claudeSettingsPath();
     const userHook = { matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] };
-    fs.mkdirSync(path.dirname(claudeSettingsPath()), { recursive: true });
-    fs.writeFileSync(claudeSettingsPath(), JSON.stringify({ model: 'opus', hooks: { PreToolUse: [userHook] } }));
-    installClaude();
-    installClaude();
-    const s = JSON.parse(fs.readFileSync(claudeSettingsPath(), 'utf8'));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ model: 'opus', hooks: { PreToolUse: [userHook] } }));
+    installClaude(file);
+    installClaude(file);
+    const s = JSON.parse(fs.readFileSync(file, 'utf8'));
     expect(s.model).toBe('opus');
     expect(s.hooks.PreToolUse).toHaveLength(2);
     expect(s.hooks.PreToolUse[0]).toEqual(userHook);
     expect(s.hooks.PreToolUse[1].matcher).toBe('Write|Edit|MultiEdit|NotebookEdit|Bash');
     expect(isAicodeClaudeCommand(s.hooks.PreToolUse[1].hooks[0].command)).toBe(true);
     expect(s.hooks.PostToolUse[0].hooks[0].command).toMatch(/hook post --tool claude$/);
-    expect(fs.existsSync(claudeSettingsPath() + '.aicode.bak')).toBe(true);
-    uninstallClaude();
-    expect(JSON.parse(fs.readFileSync(claudeSettingsPath(), 'utf8'))).toEqual({ model: 'opus', hooks: { PreToolUse: [userHook] } });
+    expect(fs.existsSync(file + '.aicode.bak')).toBe(true);
+    uninstallClaude(file);
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toEqual({ model: 'opus', hooks: { PreToolUse: [userHook] } });
   });
 
-  it('settings.json 不存在时自动创建', () => {
-    installClaude();
-    expect(JSON.parse(fs.readFileSync(claudeSettingsPath(), 'utf8')).hooks.PostToolUse).toHaveLength(1);
+  it('文件不存在时自动创建，卸载时删除', () => {
+    const file = path.join(home, 'repo', '.claude', 'settings.local.json');
+    installClaude(file);
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).hooks.PostToolUse).toHaveLength(1);
+    uninstallClaude(file);
+    expect(fs.existsSync(file)).toBe(false);
   });
 });
 
@@ -2899,6 +3131,25 @@ describe('Codex 安装器', () => {
   it('命令中的引号按 TOML 规则转义', () => {
     expect(applyCodexInstall('', '/c', `'/a b/node' 'x"y'`, 'B')).toContain(`command = "'/a b/node' 'x\\"y'"`);
   });
+
+  it('项目配置文件不存在时创建，卸载时删除；信任记录 key 使用该文件的绝对路径', () => {
+    const file = path.join(home, 'repo', '.codex', 'config.toml');
+    installCodex(file);
+    expect(fs.readFileSync(file, 'utf8')).toContain(`[hooks.state.${JSON.stringify(`${file}:pre_tool_use:0:0`)}]`);
+    uninstallCodex(file);
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it('isCodexTrusted 读取全局配置中的项目信任级别', () => {
+    fs.mkdirSync(path.join(home, '.codex'));
+    fs.writeFileSync(
+      path.join(home, '.codex', 'config.toml'),
+      '[projects."/work/a"]\ntrust_level = "trusted"\n\n[projects."/work/b"]\ntrust_level = "untrusted"\n',
+    );
+    expect(isCodexTrusted('/work/a')).toBe(true);
+    expect(isCodexTrusted('/work/b')).toBe(false);
+    expect(isCodexTrusted('/work/c')).toBe(false);
+  });
 });
 ```
 
@@ -2912,7 +3163,6 @@ Expected: FAIL，提示无法解析模块
 ```ts
 import fs from 'node:fs';
 import path from 'node:path';
-import { claudeSettingsPath } from '../paths.js';
 import { aicodeCommand } from './shell.js';
 
 export const CLAUDE_MATCHER = 'Write|Edit|MultiEdit|NotebookEdit|Bash';
@@ -2926,13 +3176,11 @@ export function isAicodeClaudeCommand(cmd: string): boolean {
   return /\bhook (pre|post) --tool claude$/.test(cmd);
 }
 
-function readSettings(): Settings {
-  const file = claudeSettingsPath();
+function readSettings(file: string): Settings {
   return fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, 'utf8')) as Settings) : {};
 }
 
-function writeSettings(s: Settings): void {
-  const file = claudeSettingsPath();
+function writeSettings(file: string, s: Settings): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   if (fs.existsSync(file) && !fs.existsSync(file + '.aicode.bak')) fs.copyFileSync(file, file + '.aicode.bak');
   fs.writeFileSync(file, JSON.stringify(s, null, 2) + '\n');
@@ -2944,29 +3192,32 @@ function stripAicode(groups: HookGroup[]): HookGroup[] {
     .filter((g) => g.hooks.length > 0);
 }
 
-export function installClaude(): void {
-  const s = readSettings();
+export function installClaude(settingsFile: string): void {
+  const s = readSettings(settingsFile);
   const hooks = (s.hooks ??= {});
   for (const [event, phase] of EVENTS) {
     const groups = stripAicode(hooks[event] ?? []);
     groups.push({ matcher: CLAUDE_MATCHER, hooks: [{ type: 'command', command: aicodeCommand(`hook ${phase} --tool claude`) }] });
     hooks[event] = groups;
   }
-  writeSettings(s);
+  writeSettings(settingsFile, s);
 }
 
-export function uninstallClaude(): void {
-  if (!fs.existsSync(claudeSettingsPath())) return;
-  const s = readSettings();
-  if (!s.hooks) return;
-  for (const [event] of EVENTS) {
-    if (!s.hooks[event]) continue;
-    const groups = stripAicode(s.hooks[event]);
-    if (groups.length) s.hooks[event] = groups;
-    else delete s.hooks[event];
+export function uninstallClaude(settingsFile: string): void {
+  if (!fs.existsSync(settingsFile)) return;
+  const s = readSettings(settingsFile);
+  if (s.hooks) {
+    for (const [event] of EVENTS) {
+      if (!s.hooks[event]) continue;
+      const groups = stripAicode(s.hooks[event]);
+      if (groups.length) s.hooks[event] = groups;
+      else delete s.hooks[event];
+    }
+    if (Object.keys(s.hooks).length === 0) delete s.hooks;
   }
-  if (Object.keys(s.hooks).length === 0) delete s.hooks;
-  writeSettings(s);
+  // 文件由 aicode 创建（无备份）且已清空时直接删除
+  if (Object.keys(s).length === 0 && !fs.existsSync(settingsFile + '.aicode.bak')) fs.unlinkSync(settingsFile);
+  else writeSettings(settingsFile, s);
 }
 ```
 
@@ -3043,28 +3294,38 @@ export function applyCodexInstall(original: string, configPath: string, preCmd: 
   return `${text}\n${block.join('\n')}\n`;
 }
 
-function configFile(): string {
-  return path.join(codexHome(), 'config.toml');
+export function installCodex(configFile: string): void {
+  fs.mkdirSync(path.dirname(configFile), { recursive: true });
+  const exists = fs.existsSync(configFile);
+  const text = exists ? fs.readFileSync(configFile, 'utf8') : '';
+  if (exists && !fs.existsSync(configFile + '.aicode.bak')) fs.copyFileSync(configFile, configFile + '.aicode.bak');
+  fs.writeFileSync(
+    configFile,
+    applyCodexInstall(text, configFile, aicodeCommand('hook pre --tool codex'), aicodeCommand('hook post --tool codex')),
+  );
 }
 
-export function installCodex(): void {
-  const file = configFile();
-  const text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
-  if (fs.existsSync(file) && !fs.existsSync(file + '.aicode.bak')) fs.copyFileSync(file, file + '.aicode.bak');
-  fs.writeFileSync(file, applyCodexInstall(text, file, aicodeCommand('hook pre --tool codex'), aicodeCommand('hook post --tool codex')));
+export function uninstallCodex(configFile: string): void {
+  if (!fs.existsSync(configFile)) return;
+  const text = removeCodexInstall(fs.readFileSync(configFile, 'utf8'));
+  // 文件由 aicode 创建（无备份）且已清空时直接删除
+  if (text.trim() === '' && !fs.existsSync(configFile + '.aicode.bak')) fs.unlinkSync(configFile);
+  else fs.writeFileSync(configFile, text);
 }
 
-export function uninstallCodex(): void {
-  const file = configFile();
-  if (!fs.existsSync(file)) return;
-  fs.writeFileSync(file, removeCodexInstall(fs.readFileSync(file, 'utf8')));
+/** Codex 只为已信任的项目加载项目级 .codex/config.toml */
+export function isCodexTrusted(repoRoot: string): boolean {
+  const file = path.join(codexHome(), 'config.toml');
+  if (!fs.existsSync(file)) return false;
+  const header = `^\\[projects\\.${escapeRe(JSON.stringify(repoRoot))}\\][ \\t]*\\n(?:[^\\[\\n].*\\n|\\n)*?trust_level\\s*=\\s*"trusted"`;
+  return new RegExp(header, 'm').test(fs.readFileSync(file, 'utf8'));
 }
 ```
 
 - [ ] **Step 5: 运行测试，确认通过**
 
 Run: `npx vitest run tests/installer-agents.test.ts`
-Expected: PASS。如果"卸载后与原文一致"失败，检查插入 feature 行时的换行：插入的是 `\n` + FEATURE_LINE，紧跟在 `[features]` 之后；移除时删掉 `FEATURE_LINE\n`，两者必须对称。
+Expected: PASS。如果"卸载后与原文一致"失败，检查 feature 行的换行：插入的是紧跟在 `[features]` 之后的 `\n` + FEATURE_LINE，移除时删掉 `FEATURE_LINE\n`，两者必须对称。
 
 - [ ] **Step 6: 提交**
 
@@ -3077,17 +3338,211 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 14: init、CLI 入口与端到端测试
+### Task 14: init（全局 / 项目模式、确认）、CLI 入口与端到端测试
 
 **Files:**
 - Create: `src/init.ts`, `src/cli.ts`
-- Test: `tests/e2e.test.ts`
+- Test: `tests/init.test.ts`, `tests/e2e.test.ts`
 
 **Interfaces:**
-- Consumes: 全部安装器、`runHook`、`runCommit`、`writeDefaultConfig`、`logError`、paths
-- Produces: `install(): string[]`、`uninstall(): string[]`；可执行文件 `dist/cli.js`，子命令包括 `init [--uninstall]`、`hook <pre|post> --tool <claude|codex>`、`commit`
+- Consumes: 全部安装器、`runHook`、`runCommit`、`writeDefaultConfig`、`logError`、`repoRoot`、`isTracked`、`localHooksPath`、paths
+- Produces:
+  - `init.ts`：`interface Step { file: string; summary: string; apply: () => void }`、`interface Plan { steps: Step[]; notes: string[] }`、`planGlobal(uninstall: boolean): Plan`、`planProject(cwd: string, uninstall: boolean): Plan`（cwd 不在 git 仓库中时抛出 Error）
+  - 可执行文件 `dist/cli.js`：`init [--project] [--uninstall] [--yes]`、`hook <pre|post> --tool <claude|codex>`、`commit`
 
-- [ ] **Step 1: 编写失败的端到端测试**
+- [ ] **Step 1: 编写 init 的失败测试**
+
+`tests/init.test.ts`：
+```ts
+import fs from 'node:fs';
+import path from 'node:path';
+import { beforeEach, describe, expect, it } from 'vitest';
+import { planGlobal, planProject } from '../src/init.js';
+import { commitAll, initRepo, sh, tmpHome } from './helpers.js';
+
+let home: string;
+beforeEach(() => {
+  home = tmpHome();
+});
+const applyAll = (plan: { steps: { apply: () => void }[] }) => plan.steps.forEach((s) => s.apply());
+
+describe('planGlobal', () => {
+  it('未安装 Codex 时不包含 Codex 步骤，并给出提示', () => {
+    const plan = planGlobal(false);
+    expect(plan.steps.map((s) => s.file)).toEqual([
+      path.join(home, '.aicode', 'config.json'),
+      path.join(home, '.claude', 'settings.json'),
+      '~/.gitconfig（core.hooksPath）',
+    ]);
+    expect(plan.notes.join('\n')).toContain('未检测到 Codex');
+  });
+});
+
+describe('planProject', () => {
+  it('不在 git 仓库中时报错', () => {
+    expect(() => planProject(home, false)).toThrow('当前目录不在 git 仓库中');
+  });
+
+  it('安装 Claude、已信任项目的 Codex、exclude 和 post-commit；卸载后全部还原', () => {
+    const repo = initRepo();
+    fs.mkdirSync(path.join(home, '.codex'));
+    fs.writeFileSync(path.join(home, '.codex', 'config.toml'), `[projects.${JSON.stringify(repo)}]\ntrust_level = "trusted"\n`);
+    const excludeBefore = fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8');
+
+    const plan = planProject(repo, false);
+    expect(plan.steps.map((s) => path.relative(repo, s.file))).toEqual(
+      expect.arrayContaining(['.claude/settings.local.json', '.codex/config.toml', '.git/info/exclude', '.git/hooks/post-commit']),
+    );
+    applyAll(plan);
+    expect(fs.existsSync(path.join(repo, '.claude', 'settings.local.json'))).toBe(true);
+    expect(fs.readFileSync(path.join(repo, '.codex', 'config.toml'), 'utf8')).toContain('# >>> aicode hooks >>>');
+    expect(sh(repo, ['status', '--porcelain'])).toBe('');
+
+    applyAll(planProject(repo, true));
+    expect(fs.existsSync(path.join(repo, '.claude', 'settings.local.json'))).toBe(false);
+    expect(fs.existsSync(path.join(repo, '.codex', 'config.toml'))).toBe(false);
+    expect(fs.existsSync(path.join(repo, '.git', 'hooks', 'post-commit'))).toBe(false);
+    expect(fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8')).toBe(excludeBefore);
+  });
+
+  it('跳过已被 git 跟踪的配置文件和未信任的 Codex 项目，并提示仓库级 hooksPath', () => {
+    const repo = initRepo();
+    fs.mkdirSync(path.join(repo, '.claude'));
+    fs.writeFileSync(path.join(repo, '.claude', 'settings.local.json'), '{}\n');
+    commitAll(repo, 'track settings');
+    fs.mkdirSync(path.join(home, '.codex'));
+    fs.writeFileSync(path.join(home, '.codex', 'config.toml'), 'model = "x"\n');
+    sh(repo, ['config', 'core.hooksPath', '.husky/_']);
+
+    const plan = planProject(repo, false);
+    const files = plan.steps.map((s) => path.relative(repo, s.file));
+    expect(files).not.toContain('.claude/settings.local.json');
+    expect(files).not.toContain('.codex/config.toml');
+    const notes = plan.notes.join('\n');
+    expect(notes).toContain('已被 git 跟踪');
+    expect(notes).toContain('未被 Codex 信任');
+    expect(notes).toContain('core.hooksPath');
+  });
+});
+```
+
+- [ ] **Step 2: 运行测试，确认失败**
+
+Run: `npx vitest run tests/init.test.ts`
+Expected: FAIL，提示无法解析 `../src/init.js`
+
+- [ ] **Step 3: 实现 init.ts**
+
+```ts
+import fs from 'node:fs';
+import path from 'node:path';
+import { writeDefaultConfig } from './config.js';
+import { isTracked, localHooksPath, repoRoot } from './git.js';
+import { installClaude, uninstallClaude } from './installer/claude.js';
+import { installCodex, isCodexTrusted, uninstallCodex } from './installer/codex.js';
+import { addExclude, removeExclude } from './installer/exclude.js';
+import {
+  installGitHooks, installProjectGitHook, projectHookPath, uninstallGitHooks, uninstallProjectGitHook,
+} from './installer/git.js';
+import { aicodeHome, claudeSettingsPath, codexHome, configPath, ledgerDir, logPath, pendingDir } from './paths.js';
+
+export interface Step { file: string; summary: string; apply: () => void }
+export interface Plan { steps: Step[]; notes: string[] }
+
+const PROJECT_CLAUDE = '.claude/settings.local.json';
+const PROJECT_CODEX = '.codex/config.toml';
+const HUSKY_NOTE = (p: string) => `该仓库设置了仓库级 core.hooksPath=${p}（如 husky），git 不会调用 aicode 的 post-commit，commit 统计不会触发`;
+
+function homeStep(): Step {
+  return {
+    file: configPath(),
+    summary: '创建 ~/.aicode 目录结构；配置文件不存在时写入默认配置',
+    apply: () => {
+      for (const dir of [aicodeHome(), ledgerDir(), pendingDir(), path.dirname(logPath())]) fs.mkdirSync(dir, { recursive: true });
+      if (!fs.existsSync(configPath())) writeDefaultConfig();
+    },
+  };
+}
+
+export function planGlobal(uninstall: boolean): Plan {
+  const steps: Step[] = [];
+  const notes: string[] = [];
+  const codexConfig = path.join(codexHome(), 'config.toml');
+  const hasCodex = fs.existsSync(codexHome());
+  if (!uninstall) steps.push(homeStep());
+  steps.push({
+    file: claudeSettingsPath(),
+    summary: uninstall ? '移除 aicode 的 PreToolUse/PostToolUse 钩子' : '合并 PreToolUse/PostToolUse 钩子（已存在的文件先备份为 .aicode.bak）',
+    apply: () => (uninstall ? uninstallClaude(claudeSettingsPath()) : installClaude(claudeSettingsPath())),
+  });
+  if (hasCodex) {
+    steps.push({
+      file: codexConfig,
+      summary: uninstall ? '移除 aicode 钩子区块与 features 标记行' : '开启 [features].hooks，追加钩子与信任记录（先备份为 .aicode.bak）',
+      apply: () => (uninstall ? uninstallCodex(codexConfig) : installCodex(codexConfig)),
+    });
+  } else {
+    notes.push('未检测到 Codex（~/.codex 不存在），已跳过');
+  }
+  steps.push({
+    file: '~/.gitconfig（core.hooksPath）',
+    summary: uninstall ? '恢复原来的全局 core.hooksPath，删除转发脚本' : '设置全局 core.hooksPath=~/.aicode/git-hooks，并生成转发到原有 hook 的脚本',
+    apply: () => (uninstall ? uninstallGitHooks() : installGitHooks()),
+  });
+  if (!uninstall) notes.push('仓库级设置了 core.hooksPath 的仓库（如 husky）不会触发 commit 统计');
+  return { steps, notes };
+}
+
+export function planProject(cwd: string, uninstall: boolean): Plan {
+  const root = repoRoot(cwd);
+  if (!root) throw new Error('当前目录不在 git 仓库中');
+  const steps: Step[] = [];
+  const notes: string[] = [];
+  const claudeFile = path.join(root, PROJECT_CLAUDE);
+  const codexFile = path.join(root, PROJECT_CODEX);
+  const excludeFile = path.join(root, '.git', 'info', 'exclude');
+  const hookFile = projectHookPath(root);
+
+  if (uninstall) {
+    steps.push({ file: claudeFile, summary: '移除 aicode 钩子', apply: () => uninstallClaude(claudeFile) });
+    steps.push({ file: codexFile, summary: '移除 aicode 钩子区块', apply: () => uninstallCodex(codexFile) });
+    steps.push({ file: excludeFile, summary: '移除 aicode 写入的忽略条目', apply: () => removeExclude(root) });
+    steps.push({ file: hookFile, summary: '删除 aicode 的 post-commit，恢复原有 hook', apply: () => uninstallProjectGitHook(root) });
+    return { steps, notes };
+  }
+
+  steps.push(homeStep());
+  const excludes: string[] = [];
+  if (isTracked(root, PROJECT_CLAUDE)) {
+    notes.push(`${PROJECT_CLAUDE} 已被 git 跟踪，为避免改动团队共享配置已跳过 Claude Code；可改用全局模式`);
+  } else {
+    steps.push({ file: claudeFile, summary: '合并 PreToolUse/PostToolUse 钩子', apply: () => installClaude(claudeFile) });
+    excludes.push(`/${PROJECT_CLAUDE}`);
+  }
+  if (isTracked(root, PROJECT_CODEX)) {
+    notes.push(`${PROJECT_CODEX} 已被 git 跟踪，已跳过 Codex；可改用全局模式`);
+  } else if (!isCodexTrusted(root)) {
+    notes.push('该项目未被 Codex 信任（~/.codex/config.toml 中没有 trust_level = "trusted"），Codex 不会加载项目级配置，已跳过 Codex');
+  } else {
+    steps.push({ file: codexFile, summary: '开启 [features].hooks，追加钩子与信任记录', apply: () => installCodex(codexFile) });
+    excludes.push(`/${PROJECT_CODEX}`);
+  }
+  if (excludes.length) {
+    steps.push({ file: excludeFile, summary: `追加忽略条目 ${excludes.join(' ')}，避免出现在 git status 中`, apply: () => addExclude(root, excludes) });
+  }
+  steps.push({ file: hookFile, summary: '写入 post-commit；已有的 hook 改名为 post-commit.aicode-orig 并在其中被调用', apply: () => installProjectGitHook(root) });
+  const local = localHooksPath(root);
+  if (local) notes.push(HUSKY_NOTE(local));
+  return { steps, notes };
+}
+```
+
+- [ ] **Step 4: 运行 init 测试，确认通过**
+
+Run: `npx vitest run tests/init.test.ts`
+Expected: PASS
+
+- [ ] **Step 5: 编写端到端失败测试**
 
 `tests/e2e.test.ts`（运行编译产物 `dist/cli.js`，`npm test` 会先执行 tsc）：
 ```ts
@@ -3103,130 +3558,119 @@ beforeEach(() => {
   home = tmpHome();
 });
 
-const run = (args: string[], input?: unknown) =>
-  spawnSync(process.execPath, [CLI, ...args], { env: { ...process.env, HOME: home }, input: input === undefined ? '' : JSON.stringify(input), encoding: 'utf8' });
+const run = (args: string[], input?: unknown, cwd?: string) =>
+  spawnSync(process.execPath, [CLI, ...args], {
+    cwd,
+    env: { ...process.env, HOME: home },
+    input: input === undefined ? '' : typeof input === 'string' ? input : JSON.stringify(input),
+    encoding: 'utf8',
+  });
 
-async function waitFor<T>(fn: () => T | null, ms = 8000): Promise<T> {
+const readEvents = () => {
+  const p = path.join(home, '.aicode', 'events.jsonl');
+  return fs.existsSync(p) ? fs.readFileSync(p, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : [];
+};
+
+async function waitForEvent(sha: string, ms = 8000) {
   const end = Date.now() + ms;
   for (;;) {
-    const v = fn();
-    if (v) return v;
-    if (Date.now() > end) throw new Error('等待超时');
+    const e = readEvents().find((x) => x.commit_sha === sha);
+    if (e) return e;
+    if (Date.now() > end) throw new Error('等待统计事件超时');
     await new Promise((r) => setTimeout(r, 100));
   }
 }
 
+/** 模拟 AI：Claude 用 Write 新建 3 行；Codex 用 exec 新建 1 行；人工改 1 行、加 1 行 */
+function simulateAiAndHuman(repo: string) {
+  const file = path.join(repo, 'src', 'a.ts');
+  const edit = { session_id: 's1', tool_use_id: 'e1', cwd: repo, tool_name: 'Write', tool_input: { file_path: file, content: '' } };
+  run(['hook', 'pre', '--tool', 'claude'], edit);
+  fs.mkdirSync(path.dirname(file));
+  fs.writeFileSync(file, 'const a = 1;\nconst b = 2;\nconst c = 3;\n');
+  run(['hook', 'post', '--tool', 'claude'], edit);
+  const exec = { session_id: 'c1', tool_use_id: 'b1', cwd: repo, tool_name: 'exec', model: 'gpt-x' };
+  run(['hook', 'pre', '--tool', 'codex'], exec);
+  fs.writeFileSync(path.join(repo, 'b.ts'), 'shell line\n');
+  run(['hook', 'post', '--tool', 'codex'], exec);
+  fs.writeFileSync(file, 'const a = 1;\nconst b = 2;\nconst c = 30;\nconst human = true;\n');
+}
+
 describe('端到端', () => {
-  it('init → 钩子采集（编辑 + shell）→ 人工修改 → git commit → 生成事件', async () => {
+  it('全局模式：init --yes → 钩子采集 → 人工修改 → git commit → 生成事件', async () => {
     fs.mkdirSync(path.join(home, '.codex'));
     fs.writeFileSync(path.join(home, '.codex', 'config.toml'), 'model = "x"\n');
-    const init = run(['init']);
-    expect(init.status).toBe(0);
+    expect(run(['init', '--yes']).status).toBe(0);
     expect(fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8')).toContain('# >>> aicode hooks >>>');
 
     const repo = initRepo();
     fs.writeFileSync(path.join(repo, 'README.md'), 'init\n');
-    commitAll(repo, 'init'); // 首次 commit 也会触发统计（全部为人工）
-
-    const file = path.join(repo, 'src', 'a.ts');
-    const edit = { session_id: 's1', tool_use_id: 'e1', cwd: repo, tool_name: 'Write', tool_input: { file_path: file, content: '' } };
-    expect(run(['hook', 'pre', '--tool', 'claude'], edit).status).toBe(0);
-    fs.mkdirSync(path.dirname(file));
-    fs.writeFileSync(file, 'const a = 1;\nconst b = 2;\nconst c = 3;\n');
-    expect(run(['hook', 'post', '--tool', 'claude'], edit).status).toBe(0);
-
-    const bash = { session_id: 'c1', tool_use_id: 'b1', cwd: repo, tool_name: 'exec', model: 'gpt-x' };
-    run(['hook', 'pre', '--tool', 'codex'], bash);
-    fs.writeFileSync(path.join(repo, 'b.ts'), 'shell line\n');
-    run(['hook', 'post', '--tool', 'codex'], bash);
-
-    fs.writeFileSync(file, 'const a = 1;\nconst b = 2;\nconst c = 30;\nconst human = true;\n'); // 人工改一行、加一行
+    commitAll(repo, 'init');
+    simulateAiAndHuman(repo);
     const sha = commitAll(repo, 'feat: e2e');
 
-    const event = await waitFor(() => {
-      const p = path.join(home, '.aicode', 'events.jsonl');
-      if (!fs.existsSync(p)) return null;
-      return fs.readFileSync(p, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).find((e) => e.commit_sha === sha) ?? null;
-    });
+    const event = await waitForEvent(sha);
     expect(event.stats).toMatchObject({ added_total: 5, added_ai: 3, added_human: 2, ai_generated: 4 });
     expect(Object.keys(event.stats.by_tool).sort()).toEqual(['claude-code/unknown', 'codex/gpt-x']);
   });
 
+  it('全局 + 项目模式同时安装时，AI 行和事件都不重复', async () => {
+    run(['init', '--yes']);
+    const repo = initRepo();
+    expect(run(['init', '--project', '--yes'], undefined, repo).status).toBe(0);
+    fs.writeFileSync(path.join(repo, 'README.md'), 'init\n');
+    commitAll(repo, 'init');
+    // 两套钩子各触发一次：pre、pre、post、post
+    const file = path.join(repo, 'x.ts');
+    const edit = { session_id: 's', tool_use_id: 'd1', cwd: repo, tool_name: 'Write', tool_input: { file_path: file, content: 'ai\n' } };
+    run(['hook', 'pre', '--tool', 'claude'], edit);
+    run(['hook', 'pre', '--tool', 'claude'], edit);
+    fs.writeFileSync(file, 'ai\n');
+    run(['hook', 'post', '--tool', 'claude'], edit);
+    run(['hook', 'post', '--tool', 'claude'], edit);
+    const sha = commitAll(repo, 'feat: dup');
+    const event = await waitForEvent(sha);
+    await new Promise((r) => setTimeout(r, 1000)); // 等第二个后台统计进程结束
+    expect(readEvents().filter((e) => e.commit_sha === sha)).toHaveLength(1);
+    expect(event.stats).toMatchObject({ added_ai: 1, ai_generated: 1 });
+  });
+
+  it('非交互环境下没有 --yes 时中止，且不写入任何文件', () => {
+    const r = run(['init']);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('--yes');
+    expect(fs.existsSync(path.join(home, '.claude', 'settings.json'))).toBe(false);
+  });
+
   it('hook 输入损坏时退出码仍为 0，并写入日志', () => {
-    const r = spawnSync(process.execPath, [CLI, 'hook', 'pre', '--tool', 'claude'], { env: { ...process.env, HOME: home }, input: '{bad', encoding: 'utf8' });
-    expect(r.status).toBe(0);
+    expect(run(['hook', 'pre', '--tool', 'claude'], '{bad').status).toBe(0);
     expect(fs.readFileSync(path.join(home, '.aicode', 'logs', 'aicode.log'), 'utf8')).toContain('[hook]');
   });
 
-  it('init --uninstall 移除全部钩子', () => {
-    run(['init']);
-    expect(run(['init', '--uninstall']).status).toBe(0);
+  it('init --uninstall --yes 移除全部钩子', () => {
+    run(['init', '--yes']);
+    expect(run(['init', '--uninstall', '--yes']).status).toBe(0);
     expect(() => execFileSync('git', ['config', '--global', '--get', 'core.hooksPath'], { cwd: home, env: { ...process.env, HOME: home } })).toThrow();
-    const settings = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8'));
-    expect(settings.hooks).toBeUndefined();
+    expect(fs.existsSync(path.join(home, '.claude', 'settings.json'))).toBe(false); // 由 aicode 创建，卸载时删除
   });
 });
 ```
 
-- [ ] **Step 2: 运行测试，确认失败**
-
-Run: `npm test -- tests/e2e.test.ts`
-Expected: FAIL（`src/init.ts` 和 `src/cli.ts` 不存在，tsc 仍能通过，但 `dist/cli.js` 不存在）
-
-- [ ] **Step 3: 实现 init.ts**
-
-```ts
-import fs from 'node:fs';
-import path from 'node:path';
-import { writeDefaultConfig } from './config.js';
-import { installClaude, uninstallClaude } from './installer/claude.js';
-import { installCodex, uninstallCodex } from './installer/codex.js';
-import { installGitHooks, uninstallGitHooks } from './installer/git.js';
-import { aicodeHome, claudeSettingsPath, codexHome, configPath, gitHooksDir, ledgerDir, logPath, pendingDir } from './paths.js';
-
-export function install(): string[] {
-  const msgs: string[] = [];
-  for (const dir of [aicodeHome(), ledgerDir(), pendingDir(), path.dirname(logPath())]) fs.mkdirSync(dir, { recursive: true });
-  if (!fs.existsSync(configPath())) {
-    writeDefaultConfig();
-    msgs.push(`已创建配置 ${configPath()}`);
-  }
-  installClaude();
-  msgs.push(`已写入 Claude Code 钩子 ${claudeSettingsPath()}`);
-  if (fs.existsSync(codexHome())) {
-    installCodex();
-    msgs.push(`已写入 Codex 钩子 ${path.join(codexHome(), 'config.toml')}`);
-  } else {
-    msgs.push('未检测到 Codex（~/.codex 不存在），已跳过');
-  }
-  installGitHooks();
-  msgs.push(`已设置全局 git core.hooksPath=${gitHooksDir()}`);
-  msgs.push('注意：仓库级设置了 core.hooksPath 的仓库（如 husky）不会触发统计');
-  return msgs;
-}
-
-export function uninstall(): string[] {
-  uninstallClaude();
-  if (fs.existsSync(codexHome())) uninstallCodex();
-  uninstallGitHooks();
-  return [`已移除 aicode 的全部钩子；统计数据保留在 ${aicodeHome()}`];
-}
-```
-
-- [ ] **Step 4: 实现 cli.ts**
+- [ ] **Step 6: 实现 cli.ts**
 
 ```ts
 #!/usr/bin/env node
+import readline from 'node:readline';
 import { runCommit } from './commit.js';
 import { runHook } from './hook.js';
-import { install, uninstall } from './init.js';
+import { planGlobal, planProject } from './init.js';
 import { logError } from './log.js';
 
 const USAGE = [
   '用法:',
-  '  aicode init [--uninstall]                  安装 / 卸载钩子',
-  '  aicode hook <pre|post> --tool <claude|codex> 由 AI 工具钩子调用',
-  '  aicode commit                              由 post-commit 调用',
+  '  aicode init [--project] [--uninstall] [--yes]   安装 / 卸载钩子（--project 仅作用于当前仓库）',
+  '  aicode hook <pre|post> --tool <claude|codex>    由 AI 工具钩子调用',
+  '  aicode commit                                   由 post-commit 调用',
 ].join('\n');
 
 async function readStdin(): Promise<string> {
@@ -3236,13 +3680,39 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+async function confirm(question: string): Promise<boolean> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise<string>((resolve) => rl.question(question, resolve));
+  rl.close();
+  return /^y(es)?$/i.test(answer.trim());
+}
+
+async function init(flags: string[]): Promise<number> {
+  const uninstall = flags.includes('--uninstall');
+  const plan = flags.includes('--project') ? planProject(process.cwd(), uninstall) : planGlobal(uninstall);
+  console.log(uninstall ? '将执行以下卸载操作：' : '将执行以下改动：');
+  for (const s of plan.steps) console.log(`  - ${s.file}\n      ${s.summary}`);
+  for (const n of plan.notes) console.log(`  ! ${n}`);
+  if (!flags.includes('--yes')) {
+    if (!process.stdin.isTTY) {
+      console.error('非交互环境下请加 --yes 确认执行');
+      return 1;
+    }
+    if (!(await confirm('确认执行？[y/N] '))) {
+      console.log('已取消，未做任何改动');
+      return 0;
+    }
+  }
+  for (const s of plan.steps) s.apply();
+  console.log('完成');
+  return 0;
+}
+
 async function main(args: string[]): Promise<number> {
   const [cmd, ...rest] = args;
   if (cmd === 'init') {
     try {
-      const msgs = rest.includes('--uninstall') ? uninstall() : install();
-      for (const m of msgs) console.log(m);
-      return 0;
+      return await init(rest);
     } catch (err) {
       console.error(`aicode init 失败: ${err instanceof Error ? err.message : String(err)}`);
       return 1;
@@ -3274,12 +3744,12 @@ async function main(args: string[]): Promise<number> {
 main(process.argv.slice(2)).then((code) => process.exit(code));
 ```
 
-- [ ] **Step 5: 运行全部测试，确认通过**
+- [ ] **Step 7: 运行全部测试，确认通过**
 
 Run: `npm test`
 Expected: tsc 成功，所有测试文件 PASS
 
-- [ ] **Step 6: 性能抽查（对照 spec 12 节）**
+- [ ] **Step 8: 性能抽查（对照 spec 12 节）**
 
 Run：
 ```bash
@@ -3288,11 +3758,11 @@ time (echo "{\"session_id\":\"p\",\"tool_use_id\":\"1\",\"cwd\":\"$PWD\",\"tool_
 ```
 Expected：`real` < 0.15s（其中 Node 启动约占 50ms）。超出时在最终汇报中如实说明。
 
-- [ ] **Step 7: 提交**
+- [ ] **Step 9: 提交**
 
 ```bash
-git add src/init.ts src/cli.ts tests/e2e.test.ts
-git commit -m "feat: 实现 init 安装卸载、CLI 入口与端到端测试
+git add src/init.ts src/cli.ts tests/init.test.ts tests/e2e.test.ts
+git commit -m "feat: 实现全局与项目模式 init、CLI 入口与端到端测试
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3315,10 +3785,18 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ## 安装
 
 ```bash
-npm install -g .      # 在本仓库目录执行（需先 npm run build）
-aicode init           # 写入 Claude Code / Codex 钩子，设置全局 git core.hooksPath
+npm install -g .                 # 在本仓库目录执行（需先 npm run build）
+
+# 全局模式：覆盖本机所有仓库（改动 ~/.claude/settings.json、~/.codex/config.toml、全局 core.hooksPath）
+aicode init
 aicode init --uninstall
+
+# 项目模式：只作用于当前仓库（改动 .claude/settings.local.json、.codex/config.toml、.git/hooks/post-commit）
+cd your-repo && aicode init --project
+aicode init --project --uninstall
 ```
+
+`init` 会先列出将要改动的文件并请求确认，加 `--yes` 可跳过确认。已存在的文件会先备份为 `*.aicode.bak`。项目模式写入的配置文件会加入 `.git/info/exclude`，不会出现在 `git status` 中；如果这些文件已被仓库跟踪，则不会修改。两种模式可以同时安装，不会重复计数。
 
 ## 配置 `~/.aicode/config.json`
 
@@ -3357,6 +3835,7 @@ export default (options) => ({
 ## 已知限制
 
 - 仓库级设置了 `core.hooksPath` 的仓库（如 husky v5+）不会触发统计
+- 项目模式下，Codex 只会加载已信任项目的 `.codex/config.toml`；未信任的项目只统计 Claude Code
 - AI 执行 shell 命令期间，人工对同一仓库的改动会被计为 AI 改动
 - rebase / squash / cherry-pick 后不迁移归属；amend 会生成一条 `amend: true` 的新事件
 ````
@@ -3368,7 +3847,8 @@ export default (options) => ({
 ```bash
 npm run build && npm install -g . && aicode init
 ```
-Expected：输出 5 行安装信息，退出码为 0
+`init` 会列出改动并请求确认，由用户在终端里亲自输入 `y`。
+Expected：输出改动清单和"完成"，退出码为 0
 
 - [ ] **Step 3: 真机验证 Claude Code 与 Codex**
 

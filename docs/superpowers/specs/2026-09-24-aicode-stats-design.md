@@ -93,7 +93,11 @@
 
 ### 4.4 基线的临时存储
 
-基线存放在 `~/.aicode/pending/<session_id>_<tool_use_id>.json`，post 读取后删除。超过 1 小时的 pending 文件在下次执行时清理。
+基线存放在 `~/.aicode/pending/<agent>_<session_id>_<tool_use_id>.json`。post 读取后把它改名为 `.done` 标记，而不是直接删除；超过 1 小时的 pending 和 `.done` 文件在下次执行时清理。
+
+**重复触发去重**：全局模式和项目模式同时安装时，同一次工具调用会触发两遍钩子。
+- pre：pending 或 `.done` 已存在时跳过
+- post：`.done` 已存在时跳过。这样第二次 post 不会因为取不到基线，而退回去用工具参数重复记录
 
 ### 4.5 预算与上限
 
@@ -166,6 +170,7 @@
 - `ai_generated`：统计开始时，ledger 中属于本次 commit 所涉及文件的记录总数；`ai_accept_rate = added_ai / ai_generated`。这是近似值：同一文件的 AI 改动如果分多次提交，未提交的部分也会被计入分母
 - `amend`：reflog 最新一条的信息以 `commit (amend)` 开头时为 true，由消费方决定是否去重
 - merge commit（有多个父提交）直接跳过
+- 去重："该 commit 是否已统计"的检查放在 ledger 锁内进行。两种安装模式同时触发两次 `aicode commit` 时，只会生成一条事件
 - 二进制文件忽略；重命名的文件按新路径匹配
 - `owner`：优先取配置中的 `owner`，否则取 git 的 `user.name` / `user.email`
 - `module`：按配置中的 `modules` glob 映射逐个文件匹配，第一个命中的规则生效；都未命中时，分支名为 `feature/xxx` 或 `hotfix/xxx` 的取 `xxx`，否则为 `unknown`。commit 级的 `module` 取新增行最多的那个模块
@@ -218,22 +223,61 @@ export interface Reporter {
 
 ## 9. 安装：`aicode init`
 
-1. 创建 `~/.aicode/` 目录结构和默认 `config.json`
-2. **Claude Code**：在 `~/.claude/settings.json` 的 `hooks.PreToolUse` 和 `hooks.PostToolUse` 中各合并一条配置，`matcher` 为 `Write|Edit|MultiEdit|NotebookEdit|Bash`，命令分别为 `aicode hook pre --tool claude` 和 `aicode hook post --tool claude`。已存在则跳过
-3. **Codex**：修改 `~/.codex/config.toml`，修改前先备份为 `config.toml.aicode.bak`：
-   - 设置 `[features].hooks = true`（已为 true 时不改动；原值为 false 时改为 true 并加 `# aicode` 标记，卸载时删除该行）
-   - 在 `[hooks]` 的 `PreToolUse` 和 `PostToolUse` 下各追加一个不带 matcher 的 command 钩子，由 aicode 自己按工具名过滤
-   - 在 `[hooks.state]` 中写入信任记录，否则 Codex 会等待用户在界面上手动信任：
-     - key：`"<config.toml 绝对路径>:<pre_tool_use|post_tool_use>:<分组下标>:<钩子下标>"`
-     - value：`{ enabled = true, trusted_hash = "<hash>" }`
-     - hash 算法：`sha256(规范化 JSON {event_name, hooks:[{type:"command", async:false, command, timeout:600}]})`，其中规范化指按 key 排序
-   - TOML 读写：只做最小范围的文本追加和替换，不引入 TOML 库。**这一步实现时必须在真机上验证 Codex 能识别**
-4. `git config --global core.hooksPath ~/.aicode/git-hooks`；如果原来已经设置了全局 hooksPath，先记录下来，转发时调用它
-5. 在 `~/.aicode/git-hooks/` 下为所有标准 hook 生成转发脚本：先调用仓库自己的 `.git/hooks/<name>`（或原全局 hooksPath 下的同名 hook），并保留其退出码。`post-commit` 在转发之后额外启动 `aicode commit`
+支持两种安装模式，统计数据都写入 `~/.aicode/`，统一汇总。
 
-提供 `aicode init --uninstall`，逆向恢复以上所有修改。
+| | 全局模式 `aicode init` | 项目模式 `aicode init --project`（在仓库内执行） |
+|---|---|---|
+| 覆盖范围 | 本机所有仓库 | 当前仓库 |
+| Claude Code | `~/.claude/settings.json` | `<仓库>/.claude/settings.local.json` |
+| Codex | `~/.codex/config.toml` | `<仓库>/.codex/config.toml`（Codex 仅对已信任的项目加载该文件；项目未被信任时提示并跳过 Codex，不修改全局信任配置） |
+| git | 全局 `core.hooksPath` + 转发脚本 | `<git-common-dir>/hooks/post-commit` |
 
-**已知限制**：在仓库级配置了 `core.hooksPath` 的仓库（例如使用 husky v5 及以上版本），仓库级配置会覆盖全局 hooksPath，`post-commit` 统计不会触发。v1 接受这一限制，并在文档中说明。
+### 9.1 共同规则
+
+1. **写入前确认**：先列出将要改动的每个文件及改动摘要，用户输入 `y` 才写入。`--yes` 可跳过确认；非交互环境（stdin 不是 TTY）下没有 `--yes` 时，直接中止并提示
+2. **先备份**：已存在的文件在首次修改前备份为 `<文件>.aicode.bak`
+3. **可逆**：`aicode init --uninstall`（全局）和 `aicode init --project --uninstall`（项目）只移除 aicode 写入的内容，其余内容原样保留
+4. 创建 `~/.aicode/` 目录结构和默认 `config.json`（两种模式都会做）
+5. 所有钩子命令都使用 node 和 CLI 的绝对路径，避免钩子运行环境中 PATH 找不到 node（如使用 nvm）
+
+### 9.2 Claude Code 钩子
+
+在 settings 文件的 `hooks.PreToolUse` 和 `hooks.PostToolUse` 中各合并一条配置：`matcher` 为 `Write|Edit|MultiEdit|NotebookEdit|Bash`，命令分别为 `aicode hook pre --tool claude` 和 `aicode hook post --tool claude`。重复安装时先移除旧的 aicode 条目再写入，保证幂等。
+
+### 9.3 Codex 钩子
+
+修改对应的 `config.toml`：
+- 设置 `[features].hooks = true`：已为 true 时不改动；原值为 false 时改为 true，并加上 `# aicode` 标记，卸载时删除该行
+- 在 `[hooks]` 的 `PreToolUse` 和 `PostToolUse` 下各追加一个不带 matcher 的 command 钩子，由 aicode 自己按工具名过滤
+- 写入信任记录 `[hooks.state."<key>"]`，否则 Codex 会等用户在界面上手动信任：
+  - key：`"<config.toml 绝对路径>:<pre_tool_use|post_tool_use>:<分组下标>:<钩子下标>"`
+  - value：`{ enabled = true, trusted_hash = "<hash>" }`
+  - hash：`sha256(规范化 JSON {event_name, hooks:[{type:"command", async:false, command, timeout:600}]})`，规范化指按 key 排序
+- aicode 写入的内容集中在 `# >>> aicode hooks >>>` 和 `# <<< aicode hooks <<<` 两个标记之间，便于卸载
+- TOML 只做最小范围的文本追加和替换，不引入 TOML 库
+- **需要真机验证**：全局模式下信任记录能否被识别；项目模式下信任记录应写在项目文件还是全局文件中、key 用哪个路径
+
+### 9.4 git hook
+
+**全局模式**：
+- 设置 `git config --global core.hooksPath ~/.aicode/git-hooks`。如果原来已设置全局 hooksPath，先记录到 `~/.aicode/install-state.json`
+- 在该目录下为所有标准 hook 生成转发脚本：原来有全局 hooksPath 时调用其中的同名 hook，否则调用仓库自己的 `.git/hooks/<name>`，并保留其退出码
+- `post-commit` 在转发之后，额外在后台启动 `aicode commit`
+
+**项目模式**：
+- 如果 `<git-common-dir>/hooks/post-commit` 已存在且不是 aicode 生成的，先改名为 `post-commit.aicode-orig`
+- 写入新的 `post-commit`：先调用 `post-commit.aicode-orig`（如有）并保留其退出码，再在后台启动 `aicode commit`
+- 卸载时删除 aicode 的 `post-commit`，并把 `.aicode-orig` 改回原名
+
+### 9.5 项目模式不污染仓库
+
+- 新建的 `.claude/settings.local.json` 和 `.codex/config.toml` 追加到 `<git-common-dir>/info/exclude`，卸载时移除这两行
+- 如果上述文件已被 git 跟踪（例如团队共享的配置），则**不修改**，并提示用户改用全局模式或手动配置
+
+### 9.6 已知限制
+
+- 仓库级配置了 `core.hooksPath` 的仓库（例如使用 husky v5 及以上版本）：全局模式的 hooksPath 会被覆盖，项目模式写入的 `.git/hooks` 也不会被调用，`post-commit` 统计都不会触发。v1 接受这一限制，`init` 检测到这种情况时给出提示
+- 项目模式下，如果该项目未被 Codex 信任，就只采集 Claude Code 的数据
 
 ## 10. 错误处理
 
