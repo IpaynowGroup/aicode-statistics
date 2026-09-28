@@ -3036,7 +3036,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 13: Claude Code 与 Codex 钩子安装器
 
-两个安装器都以**目标文件路径**作为参数，全局模式和项目模式共用同一套实现。开始前先确认 Task 1 的结论：全局和项目两个场景的 trusted_hash 都被 Codex 识别。
+两个安装器都以**目标文件路径**作为参数，全局模式和项目模式共用同一套实现。
+
+Task 1 的真机结论（见 `docs/superpowers/notes/2026-09-24-codex-hooks-probe.md`）：
+- 全局模式：钩子与信任记录都写在 `~/.codex/config.toml`，Codex 可以识别
+- 项目模式：Codex **不接受**写在仓库 `.codex/config.toml` 里的信任记录，钩子会被静默跳过。钩子定义写在项目文件中（不含 `hooks.state`），信任记录写在全局 `~/.codex/config.toml` 中，key 仍用项目配置文件的绝对路径。每个项目的信任记录用 `# >>> aicode trust <项目配置路径> >>>` / `# <<< aicode trust <项目配置路径> <<<` 包住
 
 **Files:**
 - Create: `src/installer/claude.ts`, `src/installer/codex.ts`
@@ -3046,7 +3050,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Consumes: `codexHome()`、`aicodeCommand`
 - Produces:
   - `claude.ts`：`CLAUDE_MATCHER = 'Write|Edit|MultiEdit|NotebookEdit|Bash'`、`isAicodeClaudeCommand(cmd: string): boolean`、`installClaude(settingsFile: string): void`、`uninstallClaude(settingsFile: string): void`
-  - `codex.ts`：`codexTrustHash(eventSnake: string, command: string): string`、`applyCodexInstall(text: string, configPath: string, preCmd: string, postCmd: string): string`、`removeCodexInstall(text: string): string`、`installCodex(configFile: string): void`、`uninstallCodex(configFile: string): void`、`isCodexTrusted(repoRoot: string): boolean`
+  - `codex.ts`：`codexTrustHash(eventSnake: string, command: string): string`、`applyCodexInstall(text: string, configPath: string, preCmd: string, postCmd: string, withTrust?: boolean): string`（`withTrust` 默认 true；为 false 时不写 `hooks.state`）、`removeCodexInstall(text: string): string`、`codexGroupIndexes(text: string): [number, number]`、`applyCodexTrust(text: string, projectConfigPath: string, preCmd: string, postCmd: string, indexes: [number, number]): string`、`removeCodexTrust(text: string, projectConfigPath: string): string`、`installCodex(configFile: string): void`、`uninstallCodex(configFile: string): void`、`installProjectCodex(projectConfigFile: string): void`、`uninstallProjectCodex(projectConfigFile: string): void`、`isCodexTrusted(repoRoot: string): boolean`
 - 卸载约定：卸载后文件内容为空（Claude 为 `{}`，Codex 为空白），**且没有 `.aicode.bak` 备份**（说明文件是 aicode 创建的），就删除该文件
 
 - [ ] **Step 1: 编写失败测试**
@@ -3059,7 +3063,8 @@ import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { installClaude, isAicodeClaudeCommand, uninstallClaude } from '../src/installer/claude.js';
 import {
-  applyCodexInstall, codexTrustHash, installCodex, isCodexTrusted, removeCodexInstall, uninstallCodex,
+  applyCodexInstall, applyCodexTrust, codexTrustHash, installCodex, installProjectCodex, isCodexTrusted, removeCodexInstall,
+  removeCodexTrust, uninstallCodex, uninstallProjectCodex,
 } from '../src/installer/codex.js';
 import { claudeSettingsPath } from '../src/paths.js';
 import { tmpHome } from './helpers.js';
@@ -3147,7 +3152,7 @@ describe('Codex 安装器', () => {
     expect(applyCodexInstall('', '/c', `'/a b/node' 'x"y'`, 'B')).toContain(`command = "'/a b/node' 'x\\"y'"`);
   });
 
-  it('项目配置文件不存在时创建，卸载时删除；信任记录 key 使用该文件的绝对路径', () => {
+  it('配置文件不存在时创建，卸载时删除；信任记录 key 使用该文件的绝对路径', () => {
     const file = path.join(home, 'repo', '.codex', 'config.toml');
     installCodex(file);
     expect(fs.readFileSync(file, 'utf8')).toContain(`[hooks.state.${JSON.stringify(`${file}:pre_tool_use:0:0`)}]`);
@@ -3164,6 +3169,39 @@ describe('Codex 安装器', () => {
     expect(isCodexTrusted('/work/a')).toBe(true);
     expect(isCodexTrusted('/work/b')).toBe(false);
     expect(isCodexTrusted('/work/c')).toBe(false);
+  });
+
+  it('withTrust=false 时不写信任记录', () => {
+    expect(applyCodexInstall('', '/p', 'A', 'B', false)).not.toContain('[hooks.state.');
+  });
+
+  it('applyCodexTrust 按项目区分区块，互不影响', () => {
+    const a = applyCodexTrust('x = 1\n', '/a/.codex/config.toml', 'P', 'Q', [0, 0]);
+    const ab = applyCodexTrust(a, '/b/.codex/config.toml', 'P', 'Q', [1, 0]);
+    expect(ab).toContain('[hooks.state."/b/.codex/config.toml:pre_tool_use:1:0"]');
+    expect(ab).toContain(`trusted_hash = "${codexTrustHash('post_tool_use', 'Q')}"`);
+    expect(applyCodexTrust(ab, '/b/.codex/config.toml', 'P', 'Q', [1, 0])).toBe(ab);
+    expect(removeCodexTrust(ab, '/b/.codex/config.toml')).toBe(a);
+    expect(removeCodexTrust(removeCodexTrust(ab, '/a/.codex/config.toml'), '/b/.codex/config.toml')).toBe('x = 1\n');
+  });
+
+  it('项目模式：钩子写入项目文件且不含信任记录，信任记录写入全局文件；卸载后两个文件还原', () => {
+    const globalFile = path.join(home, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(globalFile));
+    const globalOriginal = '[projects."/r"]\ntrust_level = "trusted"\n';
+    fs.writeFileSync(globalFile, globalOriginal);
+    const projectFile = path.join(home, 'r', '.codex', 'config.toml');
+    installProjectCodex(projectFile);
+    installProjectCodex(projectFile);
+    const project = fs.readFileSync(projectFile, 'utf8');
+    expect(project).toContain('[[hooks.PreToolUse]]');
+    expect(project).not.toContain('[hooks.state.');
+    const global = fs.readFileSync(globalFile, 'utf8');
+    expect(global.match(/# >>> aicode trust /g)).toHaveLength(1);
+    expect(global).toContain(`[hooks.state.${JSON.stringify(`${projectFile}:pre_tool_use:0:0`)}]`);
+    uninstallProjectCodex(projectFile);
+    expect(fs.existsSync(projectFile)).toBe(false);
+    expect(fs.readFileSync(globalFile, 'utf8')).toBe(globalOriginal);
   });
 });
 ```
@@ -3267,8 +3305,27 @@ function countGroups(text: string, event: string): number {
   return (text.match(new RegExp(`^\\[\\[hooks\\.${event}\\]\\]`, 'gm')) ?? []).length;
 }
 
-/** 以最小文本改动写入：features 开关 + 追加标记区块（钩子分组与信任记录） */
-export function applyCodexInstall(original: string, configPath: string, preCmd: string, postCmd: string): string {
+function trustLines(configPath: string, preCmd: string, postCmd: string, indexes: [number, number]): string[] {
+  const entries = [['pre_tool_use', preCmd, indexes[0]], ['post_tool_use', postCmd, indexes[1]]] as const;
+  return entries.flatMap(([snake, cmd, idx]) => [
+    `[hooks.state.${JSON.stringify(`${configPath}:${snake}:${idx}:0`)}]`,
+    'enabled = true',
+    `trusted_hash = ${JSON.stringify(codexTrustHash(snake, cmd))}`,
+    '',
+  ]);
+}
+
+/** aicode 追加的钩子分组在该文件中的下标（按去掉 aicode 区块后已有的分组数计算） */
+export function codexGroupIndexes(text: string): [number, number] {
+  const stripped = removeCodexInstall(text);
+  return [countGroups(stripped, 'PreToolUse'), countGroups(stripped, 'PostToolUse')];
+}
+
+/**
+ * 以最小文本改动写入：features 开关 + 追加标记区块（钩子分组，以及 withTrust 时的信任记录）。
+ * 项目模式传 withTrust=false：Codex 不接受仓库自身文件中的信任记录，改由 applyCodexTrust 写入全局文件。
+ */
+export function applyCodexInstall(original: string, configPath: string, preCmd: string, postCmd: string, withTrust = true): string {
   let text = removeCodexInstall(original);
   if (text.length && !text.endsWith('\n')) text += '\n';
   const block: string[] = [BEGIN];
@@ -3289,35 +3346,72 @@ export function applyCodexInstall(original: string, configPath: string, preCmd: 
     }
   }
 
-  const specs = [
-    ['PreToolUse', 'pre_tool_use', preCmd],
-    ['PostToolUse', 'post_tool_use', postCmd],
-  ] as const;
-  const indexes = specs.map(([event]) => countGroups(text, event));
-  for (const [event, , cmd] of specs) {
+  const indexes = codexGroupIndexes(text);
+  for (const [event, cmd] of [['PreToolUse', preCmd], ['PostToolUse', postCmd]] as const) {
     block.push(`[[hooks.${event}]]`, `[[hooks.${event}.hooks]]`, 'type = "command"', `command = ${JSON.stringify(cmd)}`, '');
   }
-  specs.forEach(([, snake, cmd], i) => {
-    block.push(
-      `[hooks.state.${JSON.stringify(`${configPath}:${snake}:${indexes[i]}:0`)}]`,
-      'enabled = true',
-      `trusted_hash = ${JSON.stringify(codexTrustHash(snake, cmd))}`,
-      '',
-    );
-  });
+  if (withTrust) block.push(...trustLines(configPath, preCmd, postCmd, indexes));
   block.push(END);
   return `${text}\n${block.join('\n')}\n`;
 }
 
+const trustBegin = (p: string): string => `# >>> aicode trust ${p} >>>`;
+const trustEnd = (p: string): string => `# <<< aicode trust ${p} <<<`;
+
+export function removeCodexTrust(text: string, projectConfigPath: string): string {
+  const re = new RegExp(`\\n${escapeRe(trustBegin(projectConfigPath))}\\n[\\s\\S]*?\\n${escapeRe(trustEnd(projectConfigPath))}\\n`, 'g');
+  return text.replace(re, '');
+}
+
+/** 在全局配置中追加（或替换）某个项目的信任区块 */
+export function applyCodexTrust(
+  original: string,
+  projectConfigPath: string,
+  preCmd: string,
+  postCmd: string,
+  indexes: [number, number],
+): string {
+  let text = removeCodexTrust(original, projectConfigPath);
+  if (text.length && !text.endsWith('\n')) text += '\n';
+  const block = [trustBegin(projectConfigPath), ...trustLines(projectConfigPath, preCmd, postCmd, indexes), trustEnd(projectConfigPath)];
+  return `${text}\n${block.join('\n')}\n`;
+}
+
+function readOrEmpty(file: string): string {
+  return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+}
+
+function backupOnce(file: string): void {
+  if (fs.existsSync(file) && !fs.existsSync(file + '.aicode.bak')) fs.copyFileSync(file, file + '.aicode.bak');
+}
+
+const codexCommands = (): [string, string] => [aicodeCommand('hook pre --tool codex'), aicodeCommand('hook post --tool codex')];
+
 export function installCodex(configFile: string): void {
   fs.mkdirSync(path.dirname(configFile), { recursive: true });
-  const exists = fs.existsSync(configFile);
-  const text = exists ? fs.readFileSync(configFile, 'utf8') : '';
-  if (exists && !fs.existsSync(configFile + '.aicode.bak')) fs.copyFileSync(configFile, configFile + '.aicode.bak');
-  fs.writeFileSync(
-    configFile,
-    applyCodexInstall(text, configFile, aicodeCommand('hook pre --tool codex'), aicodeCommand('hook post --tool codex')),
-  );
+  const text = readOrEmpty(configFile);
+  backupOnce(configFile);
+  const [pre, post] = codexCommands();
+  fs.writeFileSync(configFile, applyCodexInstall(text, configFile, pre, post));
+}
+
+/** 项目模式：钩子写入项目配置，信任记录写入全局配置（Codex 只认全局文件中的信任记录） */
+export function installProjectCodex(projectConfigFile: string): void {
+  const [pre, post] = codexCommands();
+  fs.mkdirSync(path.dirname(projectConfigFile), { recursive: true });
+  const text = readOrEmpty(projectConfigFile);
+  backupOnce(projectConfigFile);
+  fs.writeFileSync(projectConfigFile, applyCodexInstall(text, projectConfigFile, pre, post, false));
+  const globalFile = path.join(codexHome(), 'config.toml');
+  const globalText = readOrEmpty(globalFile);
+  backupOnce(globalFile);
+  fs.writeFileSync(globalFile, applyCodexTrust(globalText, projectConfigFile, pre, post, codexGroupIndexes(text)));
+}
+
+export function uninstallProjectCodex(projectConfigFile: string): void {
+  uninstallCodex(projectConfigFile);
+  const globalFile = path.join(codexHome(), 'config.toml');
+  if (fs.existsSync(globalFile)) fs.writeFileSync(globalFile, removeCodexTrust(fs.readFileSync(globalFile, 'utf8'), projectConfigFile));
 }
 
 export function uninstallCodex(configFile: string): void {
@@ -3401,7 +3495,8 @@ describe('planProject', () => {
   it('安装 Claude、已信任项目的 Codex、exclude 和 post-commit；卸载后全部还原', () => {
     const repo = initRepo();
     fs.mkdirSync(path.join(home, '.codex'));
-    fs.writeFileSync(path.join(home, '.codex', 'config.toml'), `[projects.${JSON.stringify(repo)}]\ntrust_level = "trusted"\n`);
+    const globalCodex = `[projects.${JSON.stringify(repo)}]\ntrust_level = "trusted"\n`;
+    fs.writeFileSync(path.join(home, '.codex', 'config.toml'), globalCodex);
     const excludeBefore = fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8');
 
     const plan = planProject(repo, false);
@@ -3411,6 +3506,7 @@ describe('planProject', () => {
     applyAll(plan);
     expect(fs.existsSync(path.join(repo, '.claude', 'settings.local.json'))).toBe(true);
     expect(fs.readFileSync(path.join(repo, '.codex', 'config.toml'), 'utf8')).toContain('# >>> aicode hooks >>>');
+    expect(fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8')).toContain('# >>> aicode trust ');
     expect(sh(repo, ['status', '--porcelain'])).toBe('');
 
     applyAll(planProject(repo, true));
@@ -3418,6 +3514,7 @@ describe('planProject', () => {
     expect(fs.existsSync(path.join(repo, '.codex', 'config.toml'))).toBe(false);
     expect(fs.existsSync(path.join(repo, '.git', 'hooks', 'post-commit'))).toBe(false);
     expect(fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8')).toBe(excludeBefore);
+    expect(fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8')).toBe(globalCodex);
   });
 
   it('跳过已被 git 跟踪的配置文件和未信任的 Codex 项目，并提示仓库级 hooksPath', () => {
@@ -3454,7 +3551,7 @@ import path from 'node:path';
 import { writeDefaultConfig } from './config.js';
 import { isTracked, localHooksPath, repoRoot } from './git.js';
 import { installClaude, uninstallClaude } from './installer/claude.js';
-import { installCodex, isCodexTrusted, uninstallCodex } from './installer/codex.js';
+import { installCodex, installProjectCodex, isCodexTrusted, uninstallCodex, uninstallProjectCodex } from './installer/codex.js';
 import { addExclude, removeExclude } from './installer/exclude.js';
 import {
   installGitHooks, installProjectGitHook, projectHookPath, uninstallGitHooks, uninstallProjectGitHook,
@@ -3521,7 +3618,7 @@ export function planProject(cwd: string, uninstall: boolean): Plan {
 
   if (uninstall) {
     steps.push({ file: claudeFile, summary: '移除 aicode 钩子', apply: () => uninstallClaude(claudeFile) });
-    steps.push({ file: codexFile, summary: '移除 aicode 钩子区块', apply: () => uninstallCodex(codexFile) });
+    steps.push({ file: codexFile, summary: '移除 aicode 钩子区块，并删除 ~/.codex/config.toml 中该项目的信任区块', apply: () => uninstallProjectCodex(codexFile) });
     steps.push({ file: excludeFile, summary: '移除 aicode 写入的忽略条目', apply: () => removeExclude(root) });
     steps.push({ file: hookFile, summary: '删除 aicode 的 post-commit，恢复原有 hook', apply: () => uninstallProjectGitHook(root) });
     return { steps, notes };
@@ -3540,7 +3637,11 @@ export function planProject(cwd: string, uninstall: boolean): Plan {
   } else if (!isCodexTrusted(root)) {
     notes.push('该项目未被 Codex 信任（~/.codex/config.toml 中没有 trust_level = "trusted"），Codex 不会加载项目级配置，已跳过 Codex');
   } else {
-    steps.push({ file: codexFile, summary: '开启 [features].hooks，追加钩子与信任记录', apply: () => installCodex(codexFile) });
+    steps.push({
+      file: codexFile,
+      summary: '写入项目钩子；并在全局 ~/.codex/config.toml 追加该项目的信任区块（Codex 只认全局文件中的信任记录；先备份为 .aicode.bak，卸载时删除该区块）',
+      apply: () => installProjectCodex(codexFile),
+    });
     excludes.push(`/${PROJECT_CODEX}`);
   }
   if (excludes.length) {
@@ -4264,6 +4365,7 @@ export default (options) => ({
 
 - 仓库级设置了 `core.hooksPath` 的仓库（如 husky v5+）不会触发统计
 - 项目模式下，Codex 只会加载已信任项目的 `.codex/config.toml`；未信任的项目只统计 Claude Code
+- 项目模式安装 Codex 时，Codex 只认全局配置中的信任记录，因此会在 `~/.codex/config.toml` 追加该项目的信任区块（卸载时删除）
 - 上报只在 commit 时触发；长时间没有 commit 时，积压的事件不会主动补发
 - AI 执行 shell 命令期间，人工对同一仓库的改动会被计为 AI 改动
 - rebase / squash / cherry-pick 后不迁移归属；amend 会生成一条 `amend: true` 的新事件

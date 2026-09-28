@@ -266,7 +266,7 @@ export interface Reporter {
 |---|---|---|
 | 覆盖范围 | 本机所有仓库 | 当前仓库 |
 | Claude Code | `~/.claude/settings.json` | `<仓库>/.claude/settings.local.json` |
-| Codex | `~/.codex/config.toml` | `<仓库>/.codex/config.toml`（Codex 仅对已信任的项目加载该文件；项目未被信任时提示并跳过 Codex，不修改全局信任配置） |
+| Codex | `~/.codex/config.toml` | 钩子定义写入 `<仓库>/.codex/config.toml`；**信任记录必须写入全局 `~/.codex/config.toml`**（见 9.3）。Codex 只为已信任的项目加载项目配置；项目未被信任时提示并跳过 Codex，不修改项目信任级别 |
 | git | 全局 `core.hooksPath` + 转发脚本 | `<git-common-dir>/hooks/post-commit` |
 
 ### 9.1 共同规则
@@ -292,7 +292,12 @@ export interface Reporter {
   - hash：`sha256(规范化 JSON {event_name, hooks:[{type:"command", async:false, command, timeout:600}]})`，规范化指按 key 排序
 - aicode 写入的内容集中在 `# >>> aicode hooks >>>` 和 `# <<< aicode hooks <<<` 两个标记之间，便于卸载
 - TOML 只做最小范围的文本追加和替换，不引入 TOML 库
-- **需要真机验证**：全局模式下信任记录能否被识别；项目模式下信任记录应写在项目文件还是全局文件中、key 用哪个路径
+- **项目模式的信任记录位置（已在 codex-cli 0.157.1 真机验证）**：Codex 不接受写在仓库自身 `.codex/config.toml` 中的信任记录（否则仓库可以给自己的钩子"盖章"），钩子会被静默跳过。正确写法是：
+  - 钩子定义（含 `[features].hooks = true`）写在 `<仓库>/.codex/config.toml`，不写 `hooks.state`
+  - 信任记录写在全局 `~/.codex/config.toml`，key 仍为项目配置文件的绝对路径：`"<仓库>/.codex/config.toml:<pre_tool_use|post_tool_use>:<分组下标>:0"`
+  - 每个项目的信任记录用 `# >>> aicode trust <项目配置路径> >>>` 和 `# <<< aicode trust <项目配置路径> <<<` 包住，项目模式卸载时只删除该项目的区块
+  - 项目模式不修改全局的 `[features]`，依赖 hooks 特性默认开启（`codex features list` 显示 hooks 为 stable/true）
+- 因此项目模式安装 Codex 时**会改动全局 `~/.codex/config.toml`**（仅追加该项目的信任区块），`init` 的确认清单中要明确列出
 
 ### 9.4 git hook
 
