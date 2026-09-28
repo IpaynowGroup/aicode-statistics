@@ -2,22 +2,23 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 实现一个零运行时依赖的 Node CLI `aicode`：通过 Claude Code / Codex 的 Pre/PostToolUse 钩子采集 AI 写入的行指纹，在全局 git `post-commit` 时计算每个 commit 的 AI 有效代码量，写入 `~/.aicode/events.jsonl`，并交给可扩展的 Reporter（默认空实现）。
+**Goal:** 实现一个轻量的 Node CLI `aicode`：通过 Claude Code / Codex 的 Pre/PostToolUse 钩子采集 AI 写入的行指纹，在 git `post-commit` 时计算每个 commit 的 AI 有效代码量，写入 `~/.aicode/events.jsonl`，并交给可扩展的 Reporter（默认空实现，内置 MySQL 5.6+ 直连上报）。
 
 **Architecture:** 钩子阶段：pre 记录基线（编辑类记单文件指纹，shell 类记 `git status` 快照），post 做多重集合差，把新增行的指纹追加到按仓库分片的 ledger。commit 阶段：解析 `git show` 的新增行，逐行消费 ledger 中的指纹，得出 AI 行和人工行，补上负责人、模块信息后生成事件。安装器支持两种模式：全局模式（`~/.claude`、`~/.codex`、全局 `core.hooksPath`）和项目模式（仓库内的 `.claude/settings.local.json`、`.codex/config.toml`、`.git/hooks/post-commit`）；两种模式同时安装时，由钩子和 commit 两处的去重保证不会重复计数。
 
-**Tech Stack:** TypeScript 5（编译到 ES2022 / NodeNext ESM）、Node ≥ 18 内置模块、vitest（仅开发依赖）、git ≥ 2.15。
+**Tech Stack:** TypeScript 5（编译到 ES2022 / NodeNext ESM）、Node ≥ 18 内置模块、mysql2（唯一运行时依赖，仅 MySQL 上报时动态加载）、vitest（仅开发依赖）、git ≥ 2.15、MySQL ≥ 5.6。
 
 **Spec:** `docs/superpowers/specs/2026-09-24-aicode-stats-design.md`
 
 ## Global Constraints
 
-- 运行时零依赖：`dependencies` 必须为空，只能使用 `node:*` 内置模块
+- 运行时依赖只允许 `mysql2` 一项，且只能在 `src/reporter/mysql.ts` 中通过动态 `import()` 加载；其余代码只能使用 `node:*` 内置模块，保证钩子路径不加载任何第三方代码
+- 数据库兼容 MySQL 5.6：不使用 JSON 列，索引键长度 ≤ 767 字节；客户端只执行 `INSERT IGNORE`，不建表
 - Node ≥ 18；兼容 git 2.15（本机版本），不得使用 `git init -b`、`GIT_CONFIG_GLOBAL` 等更新版本才有的特性
 - 所有数据写入 `~/.aicode/`（测试时通过 `HOME` 环境变量隔离）；**不存代码原文**，只存 12 位 sha1 指纹
 - `hook` 和 `commit` 子命令任何异常都只写 `~/.aicode/logs/aicode.log`，退出码恒为 0；只有 `init` 允许非 0 退出
 - 单个钩子时间预算 2000ms；`git status` 超过 50000 个文件时跳过快照；单个文件超过 1MB 时不计算指纹
-- 仓库级 `.aicode.json` 只能覆盖 `owner` / `modules` / `ignore`，`reporter` 只从全局配置读取
+- 仓库级 `.aicode.json` 只能覆盖 `owner` / `modules` / `ignore`，`reporter` 只从全局配置读取（其中可能含数据库密码）；`init` 把 `~/.aicode/config.json` 的权限设为 600
 - 代码注释和用户提示用中文；commit message 格式为 `<type>: <中文描述>`，并以 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` 结尾
 - 直接在 `main` 分支提交（用户明确要求不拆分支）
 - `init` 写入任何文件前必须列出改动并经用户确认（`--yes` 可跳过）；非交互环境下没有 `--yes` 时中止；已存在的文件先备份为 `.aicode.bak`
@@ -45,7 +46,8 @@ src/
   analyzer.ts       # diff × ledger → 统计（纯函数）
   metadata.ts       # owner / module
   events.ts         # CommitEvent 读写
-  reporter/index.ts # Reporter 接口、noop、module 加载、补发
+  reporter/index.ts # Reporter 接口、noop、module/mysql 加载、补发
+  reporter/mysql.ts # MySQL 直连上报（动态加载 mysql2）
   commit.ts         # commit 编排
   installer/shell.ts   # shell 引号与 aicode 命令拼接
   installer/exclude.ts # .git/info/exclude 标记区块
@@ -54,6 +56,7 @@ src/
   installer/codex.ts   # Codex config.toml（全局或项目文件）、trusted_hash、项目信任检测
   init.ts           # 全局 / 项目模式的安装与卸载计划
   cli.ts            # 入口
+sql/schema.sql      # MySQL 5.6+ 建表脚本（由 DBA 执行）
 tests/              # 与 src 同名的 *.test.ts，外加 helpers.ts 和 e2e.test.ts
 ```
 
@@ -2287,7 +2290,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 - Consumes: `eventsPath()`、`reportedPath()`、`CommitStats`、`FileStat`、`ReporterConfig`、`logError`
 - Produces:
   - `events.ts`：`interface CommitEvent { event_id: string; repo: string; branch: string; commit_sha: string; parent_sha: string | null; commit_message: string; committed_at: string; amend: boolean; owner: { name: string; email: string }; module: string; stats: CommitStats; files: FileStat[]; client_version: string }`、`appendEvent(e: CommitEvent): void`、`hasEvent(eventId: string): boolean`、`readUnreported(limit: number): CommitEvent[]`、`markReported(eventId: string): void`
-  - `reporter/index.ts`：`interface Reporter { name: string; report(event: CommitEvent): Promise<void> }`、`noopReporter: Reporter`、`loadReporter(cfg: ReporterConfig): Promise<Reporter>`、`flushEvents(reporter: Reporter, limit?: number): Promise<void>`
+  - `reporter/index.ts`：`interface Reporter { name: string; report(event: CommitEvent): Promise<void>; close?(): Promise<void> }`、`noopReporter: Reporter`、`loadReporter(cfg: ReporterConfig): Promise<Reporter>`、`flushEvents(reporter: Reporter, limit?: number): Promise<void>`（结束时无论成败都调用 `close()`）
 
 - [ ] **Step 1: 编写失败测试**
 
@@ -2341,12 +2344,18 @@ describe('reporter', () => {
     expect(fs.readFileSync(out, 'utf8')).toBe('a\nb\n');
   });
 
-  it('上报失败时停止，失败的事件保留，下次补发', async () => {
+  it('上报失败时停止，失败的事件保留，下次补发；无论成败都调用 close', async () => {
     appendEvent(ev('a'));
     appendEvent(ev('b'));
-    const failing: Reporter = { name: 'fail', report: async (e) => { if (e.event_id === 'b') throw new Error('网关不可用'); } };
+    let closed = 0;
+    const failing: Reporter = {
+      name: 'fail',
+      report: async (e) => { if (e.event_id === 'b') throw new Error('网关不可用'); },
+      close: async () => { closed++; },
+    };
     await flushEvents(failing);
     expect(readUnreported(50).map((e) => e.event_id)).toEqual(['b']);
+    expect(closed).toBe(1);
   });
 });
 ```
@@ -2433,6 +2442,8 @@ import { logError } from '../log.js';
 export interface Reporter {
   name: string;
   report(event: CommitEvent): Promise<void>;
+  /** 可选：释放连接等资源，flushEvents 结束时调用 */
+  close?(): Promise<void>;
 }
 
 export const noopReporter: Reporter = {
@@ -2451,16 +2462,20 @@ export async function loadReporter(cfg: ReporterConfig): Promise<Reporter> {
   return mod.default(cfg.options ?? {});
 }
 
-/** 按顺序补发未上报事件；遇到失败即停止，保证不乱序 */
+/** 按顺序补发未上报事件；遇到失败即停止，保证不乱序；结束时关闭 reporter */
 export async function flushEvents(reporter: Reporter, limit = 50): Promise<void> {
-  for (const event of readUnreported(limit)) {
-    try {
-      await reporter.report(event);
-      markReported(event.event_id);
-    } catch (err) {
-      logError(`report ${reporter.name}`, err);
-      return;
+  try {
+    for (const event of readUnreported(limit)) {
+      try {
+        await reporter.report(event);
+        markReported(event.event_id);
+      } catch (err) {
+        logError(`report ${reporter.name}`, err);
+        return;
+      }
     }
+  } finally {
+    await reporter.close?.().catch((err) => logError(`close ${reporter.name}`, err));
   }
 }
 ```
@@ -3456,10 +3471,11 @@ const HUSKY_NOTE = (p: string) => `该仓库设置了仓库级 core.hooksPath=${
 function homeStep(): Step {
   return {
     file: configPath(),
-    summary: '创建 ~/.aicode 目录结构；配置文件不存在时写入默认配置',
+    summary: '创建 ~/.aicode 目录结构；配置文件不存在时写入默认配置；把配置文件权限设为 600',
     apply: () => {
       for (const dir of [aicodeHome(), ledgerDir(), pendingDir(), path.dirname(logPath())]) fs.mkdirSync(dir, { recursive: true });
       if (!fs.existsSync(configPath())) writeDefaultConfig();
+      fs.chmodSync(configPath(), 0o600); // 可能包含数据库密码，仅本人可读写
     },
   };
 }
@@ -3602,6 +3618,7 @@ describe('端到端', () => {
     fs.writeFileSync(path.join(home, '.codex', 'config.toml'), 'model = "x"\n');
     expect(run(['init', '--yes']).status).toBe(0);
     expect(fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8')).toContain('# >>> aicode hooks >>>');
+    expect(fs.statSync(path.join(home, '.aicode', 'config.json')).mode & 0o777).toBe(0o600);
 
     const repo = initRepo();
     fs.writeFileSync(path.join(repo, 'README.md'), 'init\n');
@@ -3769,7 +3786,400 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 15: 真机验证与使用文档
+### Task 15: MySQL Reporter（兼容 MySQL 5.6）
+
+**Files:**
+- Modify: `package.json`（新增依赖 `mysql2`）
+- Create: `sql/schema.sql`
+- Create: `src/reporter/mysql.ts`
+- Modify: `src/reporter/index.ts`（`loadReporter` 支持 `type: 'mysql'`）
+- Modify: `src/config.ts`（`ReporterConfig.type` 增加 `'mysql'`）
+- Test: `tests/reporter-mysql.test.ts`
+
+**Interfaces:**
+- Consumes: `Reporter`（含可选 `close()`，见 Task 10）、`CommitEvent`、`repoKey`（git.ts）
+- Produces（`src/reporter/mysql.ts`）：
+  - `interface MysqlOptions { host: string; port: number; user: string; password?: string; database: string; connectTimeout: number }`
+  - `interface SqlConnection { beginTransaction(): Promise<unknown>; commit(): Promise<unknown>; rollback(): Promise<unknown>; execute(sql: string, params: unknown[]): Promise<unknown>; end(): Promise<unknown> }`
+  - `type ConnectionFactory = (opts: MysqlOptions) => Promise<SqlConnection>`
+  - `INSERT_COMMIT_SQL`、`INSERT_FILE_SQL`、`INSERT_TOOL_SQL: string`
+  - `toMysqlDatetime(iso: string): string`（转为 UTC `YYYY-MM-DD HH:MM:SS`）
+  - `resolveMysqlOptions(options: Record<string, unknown>): MysqlOptions`（密码优先取环境变量 `AICODE_MYSQL_PASSWORD`）
+  - `createMysqlReporter(options: Record<string, unknown>, factory?: ConnectionFactory): Reporter`
+
+约束：
+- `mysql2` 只能在 `src/reporter/mysql.ts` 中通过动态 `import('mysql2/promise')` 加载，而 `mysql.ts` 本身也只由 `loadReporter` 动态加载，保证 `hook` 路径不加载任何第三方代码
+- 兼容 MySQL 5.6：不使用 JSON 列；索引键长度 ≤ 767 字节（仓库和路径用 ASCII 哈希列作主键，邮箱用 191 前缀索引）
+- 只使用 `INSERT IGNORE`，客户端账号只需要 INSERT 权限；客户端不建表
+
+- [ ] **Step 1: 安装依赖**
+
+Run: `npm install mysql2@^3.11.0`
+Expected：`package.json` 的 `dependencies` 中只有 `mysql2` 一项
+
+- [ ] **Step 2: 编写建表脚本 `sql/schema.sql`**
+
+```sql
+-- aicode 统计表，兼容 MySQL 5.6 及以上版本（字符集 utf8mb4）。
+-- 由 DBA 执行。客户端账号只需要 INSERT 权限，即使泄露也无法读取、修改或删除数据：
+--   CREATE USER 'aicode_writer'@'%' IDENTIFIED BY '<密码>';
+--   GRANT INSERT ON ai_stats.ai_commit      TO 'aicode_writer'@'%';
+--   GRANT INSERT ON ai_stats.ai_commit_file TO 'aicode_writer'@'%';
+--   GRANT INSERT ON ai_stats.ai_commit_tool TO 'aicode_writer'@'%';
+-- MySQL 5.6 单列索引上限 767 字节，因此主键使用 ASCII 哈希列。
+
+CREATE TABLE IF NOT EXISTS ai_commit (
+  repo_key        CHAR(16)     CHARACTER SET ascii NOT NULL COMMENT 'repo 的 sha1 前 16 位',
+  commit_sha      CHAR(40)     CHARACTER SET ascii NOT NULL,
+  repo            VARCHAR(255) NOT NULL COMMENT '如 gitlab.example.com/group/project',
+  branch          VARCHAR(255) NOT NULL,
+  parent_sha      CHAR(40)     CHARACTER SET ascii NULL,
+  commit_message  TEXT         NOT NULL,
+  committed_at    DATETIME     NOT NULL COMMENT 'UTC',
+  amend           TINYINT(1)   NOT NULL DEFAULT 0,
+  owner_name      VARCHAR(128) NOT NULL,
+  owner_email     VARCHAR(255) NOT NULL,
+  module          VARCHAR(128) NOT NULL,
+  added_total     INT          NOT NULL,
+  added_ai        INT          NOT NULL,
+  added_human     INT          NOT NULL,
+  deleted_total   INT          NOT NULL,
+  ai_ratio        DECIMAL(5,3) NOT NULL,
+  ai_generated    INT          NOT NULL,
+  ai_accept_rate  DECIMAL(5,3) NOT NULL,
+  client_version  VARCHAR(32)  NOT NULL,
+  created_at      TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (repo_key, commit_sha),
+  KEY idx_repo_time (repo_key, committed_at),
+  KEY idx_owner_time (owner_email(191), committed_at),
+  KEY idx_module_time (module, committed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='每个 commit 的 AI 代码统计';
+
+CREATE TABLE IF NOT EXISTS ai_commit_file (
+  repo_key    CHAR(16)      CHARACTER SET ascii NOT NULL,
+  commit_sha  CHAR(40)      CHARACTER SET ascii NOT NULL,
+  path_sha1   CHAR(40)      CHARACTER SET ascii NOT NULL,
+  path        VARCHAR(1024) NOT NULL,
+  module      VARCHAR(128)  NOT NULL,
+  added       INT           NOT NULL,
+  ai          INT           NOT NULL,
+  PRIMARY KEY (repo_key, commit_sha, path_sha1),
+  KEY idx_module (module)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='每个 commit 中各文件的统计';
+
+CREATE TABLE IF NOT EXISTS ai_commit_tool (
+  repo_key    CHAR(16)     CHARACTER SET ascii NOT NULL,
+  commit_sha  CHAR(40)     CHARACTER SET ascii NOT NULL,
+  tool        VARCHAR(32)  CHARACTER SET ascii NOT NULL COMMENT 'claude-code / codex',
+  model       VARCHAR(128) CHARACTER SET ascii NOT NULL,
+  ai          INT          NOT NULL COMMENT '被提交的 AI 行数',
+  generated   INT          NOT NULL COMMENT 'AI 生成的行数',
+  PRIMARY KEY (repo_key, commit_sha, tool, model)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='每个 commit 按工具/模型拆分的统计';
+```
+
+- [ ] **Step 3: 编写失败测试**
+
+`tests/reporter-mysql.test.ts`：
+```ts
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import type { CommitEvent } from '../src/events.js';
+import { repoKey } from '../src/git.js';
+import { loadReporter } from '../src/reporter/index.js';
+import {
+  createMysqlReporter, INSERT_COMMIT_SQL, INSERT_FILE_SQL, INSERT_TOOL_SQL, resolveMysqlOptions, toMysqlDatetime,
+  type SqlConnection,
+} from '../src/reporter/mysql.js';
+
+const event: CommitEvent = {
+  event_id: 'gitlab.example.com/g/p:' + 'a'.repeat(40),
+  repo: 'gitlab.example.com/g/p',
+  branch: 'feature/login',
+  commit_sha: 'a'.repeat(40),
+  parent_sha: null,
+  commit_message: 'feat: 登录 🚀',
+  committed_at: '2026-09-24T10:00:00+08:00',
+  amend: true,
+  owner: { name: '张三', email: 'z@example.com' },
+  module: 'login',
+  stats: {
+    added_total: 3, added_ai: 2, added_human: 1, deleted_total: 0, ai_ratio: 0.667, ai_generated: 2, ai_accept_rate: 1,
+    by_tool: { 'claude-code/claude-opus-5-5': { ai: 1, generated: 1 }, 'codex/gpt-5.6-luna': { ai: 1, generated: 1 } },
+  },
+  files: [{ path: 'src/a.ts', module: 'login', added: 3, ai: 2 }],
+  client_version: '0.1.0',
+};
+const baseOptions = { host: 'db', user: 'aicode_writer', database: 'ai_stats', password: 'from-config' };
+
+function fakeConnection(failOn?: string) {
+  const calls: string[] = [];
+  const executed: { sql: string; params: unknown[] }[] = [];
+  const conn: SqlConnection = {
+    beginTransaction: async () => calls.push('begin'),
+    commit: async () => calls.push('commit'),
+    rollback: async () => calls.push('rollback'),
+    execute: async (sql, params) => {
+      if (failOn && sql === failOn) throw new Error('写入失败');
+      executed.push({ sql, params });
+      calls.push('execute');
+    },
+    end: async () => calls.push('end'),
+  };
+  return { conn, calls, executed };
+}
+
+afterEach(() => {
+  delete process.env.AICODE_MYSQL_PASSWORD;
+});
+
+describe('参数解析', () => {
+  it('ISO 时间转为 UTC DATETIME', () => {
+    expect(toMysqlDatetime('2026-09-24T10:00:00+08:00')).toBe('2026-09-24 02:00:00');
+  });
+
+  it('密码优先取环境变量；缺少必填项时报错', () => {
+    expect(resolveMysqlOptions(baseOptions)).toEqual({ ...baseOptions, port: 3306, connectTimeout: 5000 });
+    process.env.AICODE_MYSQL_PASSWORD = 'from-env';
+    expect(resolveMysqlOptions(baseOptions).password).toBe('from-env');
+    expect(() => resolveMysqlOptions({ host: 'db' })).toThrow('host、user、database');
+  });
+});
+
+describe('createMysqlReporter', () => {
+  it('在一个事务内写入 commit、文件和工具三张表', async () => {
+    const f = fakeConnection();
+    const reporter = createMysqlReporter(baseOptions, async () => f.conn);
+    await reporter.report(event);
+    expect(f.calls).toEqual(['begin', 'execute', 'execute', 'execute', 'execute', 'commit']);
+    const key = repoKey(event.repo);
+    expect(f.executed[0]).toEqual({
+      sql: INSERT_COMMIT_SQL,
+      params: [
+        key, event.commit_sha, event.repo, 'feature/login', null, 'feat: 登录 🚀', '2026-09-24 02:00:00', 1,
+        '张三', 'z@example.com', 'login', 3, 2, 1, 0, 0.667, 2, 1, '0.1.0',
+      ],
+    });
+    expect(f.executed[1]).toEqual({
+      sql: INSERT_FILE_SQL,
+      params: [key, event.commit_sha, createHash('sha1').update('src/a.ts').digest('hex'), 'src/a.ts', 'login', 3, 2],
+    });
+    expect(f.executed.slice(2)).toEqual([
+      { sql: INSERT_TOOL_SQL, params: [key, event.commit_sha, 'claude-code', 'claude-opus-5-5', 1, 1] },
+      { sql: INSERT_TOOL_SQL, params: [key, event.commit_sha, 'codex', 'gpt-5.6-luna', 1, 1] },
+    ]);
+  });
+
+  it('所有语句都用 INSERT IGNORE，保证重复上报幂等', () => {
+    for (const sql of [INSERT_COMMIT_SQL, INSERT_FILE_SQL, INSERT_TOOL_SQL]) expect(sql.startsWith('INSERT IGNORE INTO ')).toBe(true);
+  });
+
+  it('写入失败时回滚并抛出，让事件留待下次补发', async () => {
+    const f = fakeConnection(INSERT_FILE_SQL);
+    const reporter = createMysqlReporter(baseOptions, async () => f.conn);
+    await expect(reporter.report(event)).rejects.toThrow('写入失败');
+    expect(f.calls).toEqual(['begin', 'execute', 'rollback']);
+  });
+
+  it('多个事件共用一个连接，close 时关闭', async () => {
+    const f = fakeConnection();
+    let created = 0;
+    const reporter = createMysqlReporter(baseOptions, async () => {
+      created++;
+      return f.conn;
+    });
+    await reporter.report(event);
+    await reporter.report({ ...event, commit_sha: 'b'.repeat(40) });
+    await reporter.close?.();
+    expect(created).toBe(1);
+    expect(f.calls.at(-1)).toBe('end');
+  });
+
+  it('loadReporter 支持 type=mysql，且在首次 report 前不建立连接', async () => {
+    const reporter = await loadReporter({ type: 'mysql', options: baseOptions });
+    expect(reporter.name).toBe('mysql');
+    await reporter.close?.();
+  });
+});
+
+// 仅在提供测试库时运行，例如：AICODE_TEST_MYSQL_URL=mysql://root:pwd@127.0.0.1:3306/ai_stats_test
+const url = process.env.AICODE_TEST_MYSQL_URL;
+describe.skipIf(!url)('真实 MySQL 集成', () => {
+  it('建表后重复上报同一事件，只保留一行', async () => {
+    const mysql = await import('mysql2/promise');
+    const admin = await mysql.createConnection({ uri: url!, multipleStatements: true });
+    await admin.query('DROP TABLE IF EXISTS ai_commit, ai_commit_file, ai_commit_tool');
+    await admin.query(fs.readFileSync(path.resolve('sql/schema.sql'), 'utf8'));
+    const u = new URL(url!);
+    const reporter = createMysqlReporter({
+      host: u.hostname, port: Number(u.port || 3306), user: decodeURIComponent(u.username),
+      password: decodeURIComponent(u.password), database: u.pathname.slice(1),
+    });
+    await reporter.report(event);
+    await reporter.report(event);
+    await reporter.close?.();
+    const [rows] = await admin.query('SELECT COUNT(*) AS n FROM ai_commit');
+    const [tools] = await admin.query('SELECT COUNT(*) AS n FROM ai_commit_tool');
+    await admin.end();
+    expect((rows as { n: number }[])[0].n).toBe(1);
+    expect((tools as { n: number }[])[0].n).toBe(2);
+  });
+});
+```
+
+- [ ] **Step 4: 运行测试，确认失败**
+
+Run: `npx vitest run tests/reporter-mysql.test.ts`
+Expected: FAIL，提示无法解析 `../src/reporter/mysql.js`
+
+- [ ] **Step 5: 实现 src/reporter/mysql.ts**
+
+```ts
+import { createHash } from 'node:crypto';
+import type { CommitEvent } from '../events.js';
+import { repoKey } from '../git.js';
+import type { Reporter } from './index.js';
+
+export interface MysqlOptions {
+  host: string;
+  port: number;
+  user: string;
+  password?: string;
+  database: string;
+  connectTimeout: number;
+}
+
+/** 只声明用到的方法，便于测试注入假连接 */
+export interface SqlConnection {
+  beginTransaction(): Promise<unknown>;
+  commit(): Promise<unknown>;
+  rollback(): Promise<unknown>;
+  execute(sql: string, params: unknown[]): Promise<unknown>;
+  end(): Promise<unknown>;
+}
+export type ConnectionFactory = (opts: MysqlOptions) => Promise<SqlConnection>;
+
+// 只用 INSERT IGNORE：重复上报幂等，且客户端账号只需 INSERT 权限
+export const INSERT_COMMIT_SQL =
+  'INSERT IGNORE INTO ai_commit (repo_key, commit_sha, repo, branch, parent_sha, commit_message, committed_at, amend, ' +
+  'owner_name, owner_email, module, added_total, added_ai, added_human, deleted_total, ai_ratio, ai_generated, ' +
+  'ai_accept_rate, client_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)';
+export const INSERT_FILE_SQL =
+  'INSERT IGNORE INTO ai_commit_file (repo_key, commit_sha, path_sha1, path, module, added, ai) VALUES (?, ?, ?, ?, ?, ?, ?)';
+export const INSERT_TOOL_SQL =
+  'INSERT IGNORE INTO ai_commit_tool (repo_key, commit_sha, tool, model, ai, generated) VALUES (?, ?, ?, ?, ?, ?)';
+
+export function toMysqlDatetime(iso: string): string {
+  return new Date(iso).toISOString().slice(0, 19).replace('T', ' ');
+}
+
+export function resolveMysqlOptions(options: Record<string, unknown>): MysqlOptions {
+  const { host, user, database, port, password } = options;
+  if (typeof host !== 'string' || typeof user !== 'string' || typeof database !== 'string') {
+    throw new Error('mysql reporter 需要配置 host、user、database');
+  }
+  return {
+    host,
+    user,
+    database,
+    port: typeof port === 'number' ? port : 3306,
+    password: process.env.AICODE_MYSQL_PASSWORD ?? (typeof password === 'string' ? password : undefined),
+    connectTimeout: 5000,
+  };
+}
+
+const defaultFactory: ConnectionFactory = async (o) => {
+  const mysql = await import('mysql2/promise');
+  const conn = await mysql.createConnection({ ...o, charset: 'utf8mb4' });
+  return conn as unknown as SqlConnection;
+};
+
+export function createMysqlReporter(options: Record<string, unknown>, factory: ConnectionFactory = defaultFactory): Reporter {
+  const opts = resolveMysqlOptions(options);
+  let conn: SqlConnection | null = null;
+  return {
+    name: 'mysql',
+    async report(e: CommitEvent) {
+      conn ??= await factory(opts);
+      const key = repoKey(e.repo);
+      const s = e.stats;
+      await conn.beginTransaction();
+      try {
+        await conn.execute(INSERT_COMMIT_SQL, [
+          key, e.commit_sha, e.repo, e.branch, e.parent_sha, e.commit_message, toMysqlDatetime(e.committed_at),
+          e.amend ? 1 : 0, e.owner.name, e.owner.email, e.module, s.added_total, s.added_ai, s.added_human,
+          s.deleted_total, s.ai_ratio, s.ai_generated, s.ai_accept_rate, e.client_version,
+        ]);
+        for (const f of e.files) {
+          const pathSha1 = createHash('sha1').update(f.path).digest('hex');
+          await conn.execute(INSERT_FILE_SQL, [key, e.commit_sha, pathSha1, f.path, f.module, f.added, f.ai]);
+        }
+        for (const [toolModel, t] of Object.entries(s.by_tool)) {
+          const slash = toolModel.indexOf('/');
+          await conn.execute(INSERT_TOOL_SQL, [key, e.commit_sha, toolModel.slice(0, slash), toolModel.slice(slash + 1), t.ai, t.generated]);
+        }
+        await conn.commit();
+      } catch (err) {
+        await conn.rollback().catch(() => undefined);
+        throw err;
+      }
+    },
+    async close() {
+      if (conn) {
+        await conn.end();
+        conn = null;
+      }
+    },
+  };
+}
+```
+
+- [ ] **Step 6: 接入 loadReporter 与配置类型**
+
+`src/config.ts` 中把：
+```ts
+export interface ReporterConfig { type: 'noop' | 'module'; module?: string; options?: Record<string, unknown> }
+```
+改为：
+```ts
+export interface ReporterConfig { type: 'noop' | 'module' | 'mysql'; module?: string; options?: Record<string, unknown> }
+```
+
+`src/reporter/index.ts` 中把 `loadReporter` 替换为：
+```ts
+/** type=mysql 时动态加载 MySQL 实现；type=module 时加载自定义模块，其默认导出为 (options) => Reporter */
+export async function loadReporter(cfg: ReporterConfig): Promise<Reporter> {
+  if (cfg.type === 'mysql') {
+    const { createMysqlReporter } = await import('./mysql.js');
+    return createMysqlReporter(cfg.options ?? {});
+  }
+  if (cfg.type !== 'module' || !cfg.module) return noopReporter;
+  const mod = (await import(/* @vite-ignore */ pathToFileURL(cfg.module).href)) as {
+    default: (options: Record<string, unknown>) => Reporter;
+  };
+  return mod.default(cfg.options ?? {});
+}
+```
+
+- [ ] **Step 7: 运行测试，确认通过；确认 hook 路径不加载 mysql2**
+
+Run: `npx vitest run tests/reporter-mysql.test.ts tests/reporter.test.ts && npm run build && grep -l "mysql2" dist/*.js dist/agents/*.js || echo "hook 路径未引用 mysql2"`
+Expected：测试 PASS（集成测试在未设置 `AICODE_TEST_MYSQL_URL` 时显示 skipped）；最后输出"hook 路径未引用 mysql2"。`mysql2` 只允许出现在 `dist/reporter/mysql.js` 中。
+
+- [ ] **Step 8: 提交**
+
+```bash
+git add package.json package-lock.json sql/schema.sql src/reporter src/config.ts tests/reporter-mysql.test.ts
+git commit -m "feat: 新增兼容 MySQL 5.6 的数据库上报
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+```
+
+---
+
+### Task 16: 真机验证与使用文档
 
 **Files:**
 - Create: `README.md`
@@ -3811,6 +4221,24 @@ aicode init --project --uninstall
 
 仓库根目录的 `.aicode.json` 可以覆盖 `owner`、`modules`、`ignore`；`reporter` 只从全局配置读取。
 
+## 上报到 MySQL（5.6 及以上）
+
+1. 由 DBA 执行 `sql/schema.sql` 建表，并创建一个**只有 INSERT 权限**的账号（脚本开头有示例）
+2. 在 `~/.aicode/config.json` 中配置：
+
+```json
+{
+  "reporter": {
+    "type": "mysql",
+    "options": { "host": "db.example.com", "port": 3306, "user": "aicode_writer", "database": "ai_stats" }
+  }
+}
+```
+
+3. 密码优先从环境变量 `AICODE_MYSQL_PASSWORD` 读取，也可以写在 `options.password` 中（`init` 已把配置文件权限设为 600）。注意：commit 统计由 git hook 在后台触发，从 GUI git 客户端提交时可能读不到 shell 中设置的环境变量；这种情况下请把密码写进配置文件
+
+数据库不可达时，事件保留在本地，下次 commit 时补发（每次最多 50 条），不会阻塞 git。
+
 ## 自定义 Reporter
 
 ```js
@@ -3836,6 +4264,7 @@ export default (options) => ({
 
 - 仓库级设置了 `core.hooksPath` 的仓库（如 husky v5+）不会触发统计
 - 项目模式下，Codex 只会加载已信任项目的 `.codex/config.toml`；未信任的项目只统计 Claude Code
+- 上报只在 commit 时触发；长时间没有 commit 时，积压的事件不会主动补发
 - AI 执行 shell 命令期间，人工对同一仓库的改动会被计为 AI 改动
 - rebase / squash / cherry-pick 后不迁移归属；amend 会生成一条 `amend: true` 的新事件
 ````

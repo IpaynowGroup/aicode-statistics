@@ -6,16 +6,16 @@
 
 为 Claude Code、Codex CLI 等 AI 编码工具提供整机级实时统计：每次 git commit 时计算其中 **AI 生成且最终被提交的有效代码行数**，附带负责人、功能模块、commit 信息，汇总到本机全局存储，并通过可扩展的 `Reporter` 接口上报（默认空实现）。
 
-设计原则：**轻量**——零运行时依赖、无常驻进程、不阻塞 AI 工具和 git、不存代码原文。
+设计原则：**轻量**——无常驻进程、不阻塞 AI 工具和 git、不存代码原文；运行时依赖只有 MySQL 驱动 `mysql2` 一项，且仅在上报时动态加载，钩子路径零依赖。
 
 ### 范围内
 - 本地 CLI `aicode`（TypeScript 编译为 JS，Node ≥ 18，npm 分发，仅使用 Node 内置模块；兼容 git ≥ 2.15）
 - Claude Code、Codex CLI 的钩子采集，覆盖文件编辑工具和 shell 工具
 - 全局 git hook 触发的 commit 统计
-- `Reporter` 扩展接口，默认 `NoopReporter`
+- `Reporter` 扩展接口，默认 `NoopReporter`；内置 MySQL（5.6 及以上）直连上报
 
 ### 范围外（后续迭代）
-- HTTP 网关上报实现、失败重试队列
+- HTTP 网关上报实现、定时补发（上报只在 commit 时触发）
 - 服务端存储、看板、跨机器汇总
 - 工号 / LDAP 对接
 - rebase / squash / cherry-pick 后的归属迁移
@@ -204,7 +204,8 @@ composer.lock  Pipfile.lock  shrinkwrap.yaml  *.generated.*  *.min.js  *.min.css
 }
 ```
 
-- `reporter.type` 可选 `noop` 或 `module`；`module` 和 `options` 只在 `type` 为 `module` 时生效
+- `reporter.type` 可选 `noop`、`module` 或 `mysql`；`module` 只在 `type` 为 `module` 时生效，`options` 原样传给对应的 Reporter
+- 全局配置文件可能包含数据库密码，`init` 会把它的权限设为 600
 - glob 只支持 `**`、`*`、`?`，由内置的小函数转换为正则；不含 `/` 的模式匹配任意层级下的文件名
 
 ## 8. Reporter 扩展接口
@@ -220,6 +221,42 @@ export interface Reporter {
 - 默认使用 `NoopReporter`，`report` 直接返回
 - `report` 成功后，把 `event_id` 追加到 `events.reported.jsonl`；失败时只写日志。每次执行 `aicode commit` 时，补发未上报的事件，每次最多 50 条
 - 以后接入 HTTP 网关：新增 `HttpReporter` 并注册为 `type: http`，其他代码不用改
+
+### 8.1 MySQL 上报（`type: "mysql"`）
+
+开发机直接连接团队 MySQL 写入统计数据。
+
+**配置**：
+```json
+"reporter": {
+  "type": "mysql",
+  "options": { "host": "db.example.com", "port": 3306, "user": "aicode_writer", "database": "ai_stats", "password": "可选" }
+}
+```
+密码优先读取环境变量 `AICODE_MYSQL_PASSWORD`，没有时读取 `options.password`。
+
+**安全**：
+- DBA 创建**只有 INSERT 权限**的专用账号，账号即使泄露也无法读取、修改或删除数据
+- 客户端不建表；建表脚本 `sql/schema.sql` 由 DBA 执行
+
+**兼容 MySQL 5.6**：
+- 不使用 JSON 列：按工具拆分的统计单独存一张表 `ai_commit_tool`
+- 5.6 默认单列索引上限为 767 字节，所以主键使用 ASCII 哈希列：`repo_key`（repo 的 sha1 前 16 位）、`path_sha1`；邮箱索引使用 191 字符前缀
+- 字符集为 `utf8mb4`，时间统一存 UTC 的 `DATETIME`
+
+**表结构**：
+
+| 表 | 主键 | 内容 |
+|---|---|---|
+| `ai_commit` | `(repo_key, commit_sha)` | 仓库、分支、负责人、模块、各项行数、AI 占比、采纳率、提交时间；索引：仓库+时间、负责人+时间、模块+时间 |
+| `ai_commit_file` | `(repo_key, commit_sha, path_sha1)` | 文件路径、模块、新增行数、AI 行数 |
+| `ai_commit_tool` | `(repo_key, commit_sha, tool, model)` | 按工具/模型统计的 AI 行数和生成行数 |
+
+**写入**：
+- 同一事件的三张表在一个事务中写入；全部使用 `INSERT IGNORE`，重复上报幂等，也不需要 UPDATE 权限
+- 一次补发共用一个连接，结束时关闭（`Reporter` 接口增加可选的 `close()`）；连接超时 5 秒
+- 写入失败则回滚并抛出异常，事件留在本地，下次 commit 时补发
+- `mysql2` 只在 `type` 为 `mysql` 时动态加载
 
 ## 9. 安装：`aicode init`
 
@@ -296,7 +333,9 @@ src/
   analyzer.ts            # diff × ledger → 统计
   metadata.ts            # owner / module
   config.ts              # 读取并合并 JSON 配置
-  reporter/index.ts      # 接口、注册表、noop、module 加载
+  reporter/index.ts      # 接口、注册表、noop、module/mysql 加载
+  reporter/mysql.ts      # MySQL 直连上报（动态加载 mysql2）
+sql/schema.sql           # MySQL 5.6+ 建表脚本
   agents/claude.ts       # 解析钩子输入、工具分类、模型识别
   agents/codex.ts
   installer/claude.ts
@@ -309,5 +348,6 @@ src/
 - 单元测试（vitest，仅作为开发依赖）：fingerprint 与多重集合差、diff 解析、ignore 匹配、ledger 消费计数与加锁、module 映射、config 合并、reporter 加载、Codex trusted_hash 计算
 - 钩子测试：以 Claude Code / Codex 的 Pre/Post 钩子 stdin 样本为 fixture，覆盖编辑类、shell 类、基线丢失、超时等场景
 - 集成测试：用临时 HOME 和临时 git 仓库，执行 `init` → 模拟 pre/post（含一次 shell 写文件）→ 人工修改部分行 → 真实 `git commit` → 断言 `events.jsonl` 中的 AI 行数、人工行数和 `ai_generated`，并验证仓库原有 hook 仍被调用
+- MySQL：单元测试注入假连接，校验 SQL、参数、事务和回滚；设置 `AICODE_TEST_MYSQL_URL` 时对真实 MySQL 跑集成测试（验证重复上报幂等）
 - 真机验证：在本机 Claude Code 和 Codex（0.155.1）上各完成一次"AI 修改 → 提交"，核对统计结果
 - 性能：编辑类钩子 < 50ms；shell 类钩子在 1 万个文件的仓库中 < 300ms；包含 1000 行改动的 commit，统计耗时 < 1s
