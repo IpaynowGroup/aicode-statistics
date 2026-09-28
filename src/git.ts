@@ -160,3 +160,16 @@ export function commitDiff(root: string, sha: string): FileDiff[] {
 export function isAmend(root: string): boolean {
   return (tryGit(root, ['reflog', '-1', '--format=%gs']) ?? '').startsWith('commit (amend)');
 }
+
+export function gitCommonDir(repo: string): string {
+  return path.resolve(repo, git(repo, ['rev-parse', '--git-common-dir']).trim());
+}
+
+export function isTracked(repo: string, rel: string): boolean {
+  return tryGit(repo, ['ls-files', '--error-unmatch', rel]) !== null;
+}
+
+/** 仓库级 core.hooksPath（如 husky），存在时全局与项目模式的 hook 都不会被 git 调用 */
+export function localHooksPath(repo: string): string | null {
+  return tryGit(repo, ['config', '--local', '--get', 'core.hooksPath'])?.trim() || null;
+}
