@@ -108,7 +108,7 @@
 
 ### 4.6 模型识别
 
-- Codex：优先取钩子输入中的 `model`，没有时读取会话日志首行 `session_meta.payload.model`
+- Codex：优先取钩子输入中的 `model`；没有时从会话日志末尾最多 256KB 中，找到最近一条 `turn_context.payload.model`（已在 codex-cli 0.155.1/0.157.1 实测：`session_meta` 中不含模型名，且每轮对话都可能更换模型）
 - Claude Code：从 `transcript_path` 文件末尾最多 64KB 中，找到最近一条 assistant 消息的 `message.model`
 - 识别失败时记为 `unknown`
 
