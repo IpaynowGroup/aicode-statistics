@@ -100,3 +100,112 @@ Codex 仍然正常执行了 apply_patch 与 shell 操作（说明项目信任本
 ## 安全说明
 
 本笔记及运行日志中未包含任何 `auth.json` 中的 token/secret 内容；`tool_input`/`tool_response` 相关字段仅记录了字段名与本次探针命令本身（新建 `a.txt`/`b.txt`、`echo world`），未发现敏感内容需要脱敏。
+
+---
+
+## 追加验证（方案 B）：项目级钩子信任记录应写在哪里
+
+用户选择方案 B：继续研究项目级 Codex 钩子为何不触发，而不是仅回退到"只支持全局模式"。
+
+### 假设
+
+Codex 出于安全考虑，拒绝信任"写在仓库自己的 `.codex/config.toml` 里"的信任状态（因为这等于项目自己给自己的钩子盖章，绕过了用户确认）；项目级钩子要生效，`[hooks.state."<key>"]` 必须写在全局 `CODEX_HOME/config.toml` 中，即便钩子*定义*本身仍然放在项目 `.codex/config.toml`。
+
+### Step A：低成本证据（未发起真实请求）
+
+1. 定位真实的 codex 原生二进制（`codex` 命令是 `@openai/codex` npm 包里的 Node 包装脚本，实际按平台转发到 `node_modules/@openai/codex-darwin-x64/vendor/x86_64-apple-darwin/bin/codex`），对其跑 `strings` 并 grep 关键字：
+
+   ```
+   strings <codex 原生二进制> | grep -F "trusted_hash" | sort -u
+   strings <codex 原生二进制> | grep -iE "hook.{0,40}(trust|review|approv|disab|skip|untrust)" | sort -u
+   ```
+
+2. 关键发现（均为二进制中的字符串/结构体名，不涉及任何密钥）：
+   - 存在一个显式的配置来源枚举：`Admin config / User config / Project config / Session flags / Cloud-managed config / Unknown source`，说明 Codex 内部确实区分"项目配置层"和其它层，且钩子/信任在概念上是"分层"读取、合并的。
+   - `codex exec --help` 中存在 `--dangerously-bypass-hook-trust`：*"Run enabled hooks without requiring persisted hook trust for this invocation. DANGEROUS. Intended only for automation that already vets hook sources"*。这是一个现成的诊断开关：可以先跳过信任校验，单独验证"钩子定义有没有被加载/执行"，从而把"加载问题"和"信任匹配问题"分开，不需要盲猜 key 格式就能定位问题所在层。
+   - 二进制中还有 `config/batchWrite failed while updating hook trust in TUI`，说明交互式 TUI 下信任是通过一个统一的 "config/batchWrite" 写操作持久化的，暗示信任记录的写入路径是被框架统一管理的，而不是"信任写在哪个文件都行"。
+   - 另外找到了一类"某些字段必须写在非项目配置层"的报错模板（如 `` `[features].use_xaa = true` must be selected in a non-project config layer``），但列举到的具体字段属于企业级 MCP/auto-review 相关配置，字符串里没有直接看到专门针对 `hooks.state`/`trusted_hash` 的同类模板；不能由此直接证明"信任状态"被列入了同一类限制，只能作为"Codex 确实存在'部分配置项禁止写在项目层'这种设计模式"的旁证。
+   - 未找到与"项目自身声明钩子已受信任"直接矛盾的报错字符串（例如没有找到 "project cannot self-trust hooks" 这类文本），说明 Codex 大概率不会对着"写反了位置"报错提示，而是静默不触发——这与本任务第一轮 project 场景"exit 0、无 trust/review 字样、hook calls=0"的现象一致。
+
+3. 未能获取到 git-ai 源码：协调者提供的路径 `/private/tmp/claude-501/.../scratchpad/git-ai` 在本机不存在（`ls`/`find` 均未找到任何 `git-ai` 目录或 `codex.rs` 文件）。本轮验证结论完全基于对 codex 原生二进制字符串的分析，未能与 git-ai 的 `src/mdm/agents/codex.rs` 实现做交叉核对，这是一个已知局限，如实记录。
+
+结论：现有证据不足以精确定位官方源码里的判定逻辑，但足以支持"应优先用 `--dangerously-bypass-hook-trust` 做加载/信任分离测试，再针对性验证'信任记录搬到全局文件'"这一测试顺序，避免盲目枚举 key 变体。
+
+### Step B：真实 Codex 请求（本轮共发起 2 次，未超过预算 3 次）
+
+#### 请求 1：`project-bypass`（诊断：项目级钩子定义是否被加载）
+
+文件布局与第一轮 `project` 场景完全一致（钩子定义 + `[hooks.state.*]` 信任记录都写在 `<repo>/.codex/config.toml`，全局文件只声明 `[projects."<repo>"] trust_level = "trusted"`），唯一区别是调用 `codex exec` 时追加 `--dangerously-bypass-hook-trust`。
+
+```
+node scripts/probe-codex-hooks.mjs project-bypass
+```
+
+```
+===== 场景 project-bypass =====
+codex exit: 0
+repo files: [ '.codex', '.git', 'a.txt', 'b.txt' ]
+hook calls: 8
+pre  Bash        session_id,turn_id,transcript_path,cwd,hook_event_name,model,permission_mode,tool_name,tool_input,tool_use_id
+post Bash        session_id,turn_id,transcript_path,cwd,hook_event_name,model,permission_mode,tool_name,tool_input,tool_response,tool_use_id
+pre  Bash        ...(同上，第二次 shell 调用)
+post Bash        ...
+pre  apply_patch session_id,turn_id,transcript_path,cwd,hook_event_name,model,permission_mode,tool_name,tool_input,tool_use_id
+post apply_patch session_id,turn_id,transcript_path,cwd,hook_event_name,model,permission_mode,tool_name,tool_input,tool_response,tool_use_id
+pre  Bash        ...
+post Bash        ...
+```
+
+**结论：项目 `.codex/config.toml` 里的钩子定义本身是能被正常加载并执行的**（8 次调用，覆盖 `apply_patch` 和 `Bash` 两种 `tool_name`）。第一轮 `project` 场景 `hook calls = 0` 不是"钩子没被读到"，而是"钩子被读到了，但因为信任状态没通过校验，被静默跳过执行"。
+
+#### 请求 2：`project-global-state`（验证假设：信任记录搬到全局文件）
+
+布局：
+- 项目 `<repo>/.codex/config.toml`：只放 `[features] hooks = true` + 两个 `[[hooks.PreToolUse]]`/`[[hooks.PostToolUse]]` 分组，**不含** `[hooks.state.*]`。
+- 全局 `CODEX_HOME/config.toml`：`[features] hooks = true` + `[projects."<repo>"] trust_level = "trusted"` + 两个 `[hooks.state."<repo>/.codex/config.toml:pre_tool_use:0:0"]` / `...post_tool_use:0:0` 信任记录（key 路径仍然指向项目配置文件的绝对路径，`trusted_hash` 算法与第一轮完全相同）。
+- 调用方式与第一轮相同，**不带** `--dangerously-bypass-hook-trust`。
+
+```
+node scripts/probe-codex-hooks.mjs project-global-state
+```
+
+```
+===== 场景 project-global-state =====
+codex exit: 0
+repo files: [ '.codex', '.git', 'a.txt', 'b.txt' ]
+hook calls: 8
+pre  Bash        session_id,turn_id,transcript_path,cwd,hook_event_name,model,permission_mode,tool_name,tool_input,tool_use_id
+post Bash        session_id,turn_id,transcript_path,cwd,hook_event_name,model,permission_mode,tool_name,tool_input,tool_response,tool_use_id
+pre  Bash        ...
+post Bash        ...
+pre  apply_patch session_id,turn_id,transcript_path,cwd,hook_event_name,model,permission_mode,tool_name,tool_input,tool_use_id
+post apply_patch session_id,turn_id,transcript_path,cwd,hook_event_name,model,permission_mode,tool_name,tool_input,tool_response,tool_use_id
+pre  Bash        ...
+post Bash        ...
+```
+
+**假设验证成功**：把 `[hooks.state.*]` 信任记录从项目 `.codex/config.toml` 搬到全局 `CODEX_HOME/config.toml`（key 路径不变，仍是项目配置文件的绝对路径），且不使用任何 bypass 开关，项目级钩子就能正常触发（8 次调用，`hook calls` ≥ 4，字段列表与全局场景一致）。因为第 2 次请求已经找到能稳定触发的写法，按控制器规则"stopping at the first one that fires hooks"，本轮验证到此结束，**未运行 S4（key 路径 realpath 变体）**，脚本中保留了 `project-global-state-realpath` 场景代码以备后续需要，但本次未执行。
+
+### 最终结论（写入项目级钩子的正确布局）
+
+| 内容 | 应该写在哪个文件 |
+|---|---|
+| `[features] hooks = true` | 全局 `CODEX_HOME/config.toml` 与项目 `<repo>/.codex/config.toml` 都需要写（两轮验证都是两处都写；未单独测试"只写一处是否够"，如需精确裁剪需另外验证） |
+| `[projects."<repo 绝对路径>"] trust_level = "trusted"` | 全局 `CODEX_HOME/config.toml` |
+| `[[hooks.PreToolUse]]` / `[[hooks.PostToolUse]]` 钩子定义 | 项目 `<repo>/.codex/config.toml` |
+| `[hooks.state."<repo>/.codex/config.toml:pre_tool_use:0:0"]` / `...post_tool_use:0:0` 信任记录（`enabled = true` + `trusted_hash`） | **全局 `CODEX_HOME/config.toml`**（不能写在项目 `.codex/config.toml` 自身里——那样会被静默忽略，不报错、也不触发钩子） |
+| key 路径格式 | 仍是"项目配置文件的绝对路径"（`<repo>/.codex/config.toml`），不需要 realpath 规整或改成别的形式（本轮验证到此即成功，未测试 realpath 变体） |
+
+即：**Task 13 的项目模式实现应改为——项目 `.codex/config.toml` 只承载 `[features] hooks = true` 与钩子定义，而信任记录（`[hooks.state.*]`）必须和全局模式的信任记录写在同一个文件——全局 `CODEX_HOME/config.toml`，用项目配置文件的绝对路径拼 key。** 这与最初 spec 里"信任记录写在项目文件里（key 为项目配置文件的绝对路径）"的假设不同：key 仍然用项目配置文件路径，但**存放信任记录的文件应该是全局文件，而不是项目文件本身**。
+
+### 局限 / 未验证事项
+
+- 未能核对 git-ai 的 `src/mdm/agents/codex.rs` 实现（该源码在本机不存在），本结论纯粹基于二进制字符串分析 + 真机试验得出，建议后续如能拿到 git-ai 源码或 Codex 官方文档，再做一次交叉核对。
+- 未测试"项目 `.codex/config.toml` 里不写 `[features] hooks = true`，只在全局写"是否也能生效（本轮两处都写了，没有做减法实验）。
+- 未测试 key 路径的 realpath / 符号链接变体（S4），因为 S3 已经成功，按规则未继续消耗真实请求。
+
+### 本轮清理
+
+- 涉及的临时工作目录（含 `auth.json` 副本）：`codex-probe-project-bypass-tdy60Z`、`codex-probe-project-global-state-DrDaUB`，已在写完本节后删除。
+- `~/.aicode-probe-project-bypass-*.log`、`~/.aicode-probe-project-global-state-*.log` 已删除。
+- 未修改 `~/.codex/config.toml`、`~/.claude`、全局 git 配置。
