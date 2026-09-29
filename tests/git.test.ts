@@ -113,4 +113,37 @@ describe('仓库操作', () => {
     sh(repo, ['commit', '-q', '-a', '--amend', '-m', 'feat: 修改']);
     expect(isAmend(repo)).toBe(true);
   });
+
+  it('commitDiff 能处理带空格的路径', () => {
+    const repo = initRepo();
+    fs.writeFileSync(path.join(repo, 'new file.txt'), 'a\n');
+    const sha = commitAll(repo, 'feat: 空格路径');
+    expect(commitDiff(repo, sha)).toEqual([{ path: 'new file.txt', oldPath: null, added: ['a'], deleted: 0, binary: false }]);
+  });
+
+  it('commitDiff 能处理带双引号的路径（新建与重命名）', () => {
+    const repo = initRepo();
+    const quoted = 'a"b.ts';
+    fs.writeFileSync(path.join(repo, quoted), 'x\n');
+    const sha1 = commitAll(repo, 'feat: 引号路径');
+    expect(commitDiff(repo, sha1)).toEqual([{ path: quoted, oldPath: null, added: ['x'], deleted: 0, binary: false }]);
+
+    const renamed = 'b"c.ts';
+    sh(repo, ['mv', quoted, renamed]);
+    const sha2 = commitAll(repo, 'feat: 引号路径重命名');
+    expect(commitDiff(repo, sha2)).toEqual([{ path: renamed, oldPath: quoted, added: [], deleted: 0, binary: false }]);
+
+    fs.unlinkSync(path.join(repo, renamed));
+    const sha3 = commitAll(repo, 'feat: 删除引号路径');
+    expect(commitDiff(repo, sha3)).toEqual([{ path: renamed, oldPath: null, added: [], deleted: 1, binary: false }]);
+  });
+
+  it('commitDiff 在 core.quotepath 默认开启时能处理非 ASCII 路径', () => {
+    const repo = initRepo();
+    // 不设置 core.quotepath，使用 git 默认值（true，非 ASCII 字节会被引号+八进制转义）
+    const name = '文件.txt';
+    fs.writeFileSync(path.join(repo, name), '内容\n');
+    const sha = commitAll(repo, 'feat: 中文路径');
+    expect(commitDiff(repo, sha)).toEqual([{ path: name, oldPath: null, added: ['内容'], deleted: 0, binary: false }]);
+  });
 });

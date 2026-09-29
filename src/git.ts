@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 
 export function git(cwd: string, args: string[]): string {
-  return execFileSync('git', ['-c', 'core.quotepath=off', ...args], {
+  return execFileSync('git', args, {
     cwd,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
@@ -122,6 +122,66 @@ export interface FileDiff {
   binary: boolean;
 }
 
+/** git 用 C 风格引号包裹含特殊字符（引号、反斜杠）或非 ASCII 字节（core.quotepath 默认开启）的路径 */
+function unquotePath(raw: string): string {
+  if (raw.length < 2 || raw[0] !== '"' || raw[raw.length - 1] !== '"') return raw;
+  const inner = raw.slice(1, -1);
+  const bytes: number[] = [];
+  const singleEscapes: Record<string, number> = {
+    '"': 0x22, '\\': 0x5c, 'n': 0x0a, 't': 0x09, 'a': 0x07, 'b': 0x08, 'f': 0x0c, 'r': 0x0d, 'v': 0x0b,
+  };
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c !== '\\') {
+      bytes.push(c.charCodeAt(0));
+      continue;
+    }
+    const next = inner[i + 1];
+    if (next >= '0' && next <= '7') {
+      let oct = '';
+      let j = i + 1;
+      while (j < inner.length && oct.length < 3 && inner[j] >= '0' && inner[j] <= '7') {
+        oct += inner[j];
+        j++;
+      }
+      bytes.push(parseInt(oct, 8) & 0xff);
+      i = j - 1;
+      continue;
+    }
+    if (next in singleEscapes) {
+      bytes.push(singleEscapes[next]);
+      i++;
+      continue;
+    }
+    bytes.push(next.charCodeAt(0));
+    i++;
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+/** 去掉一个可能存在的、用于消除路径末尾空白歧义的尾部 \t，再做去引号处理 */
+function cleanDiffPath(raw: string): string {
+  const trimmed = raw.endsWith('\t') ? raw.slice(0, -1) : raw;
+  return unquotePath(trimmed);
+}
+
+/** diff --git 行在路径需要引号时，整个 a/xxx、b/xxx 一起被引号包裹（含前缀） */
+function parseDiffGitLine(line: string): { a: string; b: string } | null {
+  const rest = line.slice('diff --git '.length);
+  const plain = /^a\/(.*) b\/(.*)$/.exec(rest);
+  if (plain) return { a: plain[1], b: plain[2] };
+  const quoted = /^("(?:[^"\\]|\\.)*") ("(?:[^"\\]|\\.)*")$/.exec(rest);
+  if (quoted) return { a: unquotePath(quoted[1]).replace(/^a\//, ''), b: unquotePath(quoted[2]).replace(/^b\//, '') };
+  const mixed = /^("(?:[^"\\]|\\.)*"|\S+) ("(?:[^"\\]|\\.)*"|\S+)$/.exec(rest);
+  if (mixed) {
+    return {
+      a: unquotePath(mixed[1]).replace(/^a\//, ''),
+      b: unquotePath(mixed[2]).replace(/^b\//, ''),
+    };
+  }
+  return null;
+}
+
 export function parseUnifiedDiff(text: string): FileDiff[] {
   const files: FileDiff[] = [];
   let cur: FileDiff | null = null;
@@ -131,8 +191,8 @@ export function parseUnifiedDiff(text: string): FileDiff[] {
       cur = { path: '', oldPath: null, added: [], deleted: 0, binary: false };
       files.push(cur);
       inHunk = false;
-      const m = /^diff --git a\/(.*) b\/(.*)$/.exec(line);
-      if (m) cur.path = m[2];
+      const m = parseDiffGitLine(line);
+      if (m) cur.path = m.b;
       continue;
     }
     if (!cur) continue;
@@ -141,9 +201,9 @@ export function parseUnifiedDiff(text: string): FileDiff[] {
       continue;
     }
     if (!inHunk) {
-      if (line.startsWith('rename from ')) cur.oldPath = line.slice('rename from '.length);
-      else if (line.startsWith('rename to ')) cur.path = line.slice('rename to '.length);
-      else if (line.startsWith('+++ ') && line !== '+++ /dev/null') cur.path = line.slice(4).replace(/^b\//, '');
+      if (line.startsWith('rename from ')) cur.oldPath = cleanDiffPath(line.slice('rename from '.length));
+      else if (line.startsWith('rename to ')) cur.path = cleanDiffPath(line.slice('rename to '.length));
+      else if (line.startsWith('+++ ') && line !== '+++ /dev/null') cur.path = cleanDiffPath(line.slice(4)).replace(/^b\//, '');
       else if (line.startsWith('Binary files ')) cur.binary = true;
       continue;
     }
