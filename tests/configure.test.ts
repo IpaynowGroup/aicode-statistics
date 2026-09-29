@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { readGlobalConfig, updateGlobalConfig } from '../src/config.js';
 import {
@@ -93,6 +94,33 @@ describe('hasInsertGrant', () => {
   it('授权在其他库上不通过', () => {
     expect(hasInsertGrant(['GRANT ALL PRIVILEGES ON `other_db`.* TO `u`@`%`'], 'ai_stats')).toBe(false);
   });
+
+  it('转义的 \\_ 按字面量匹配（不是通配符）', () => {
+    expect(hasInsertGrant(['GRANT INSERT ON `ai\\_stats`.* TO `u`@`%`'], 'ai_stats')).toBe(true);
+    // 字面量 ai\_stats 不应匹配 "aiXstats"（\_ 不再是通配符）
+    expect(hasInsertGrant(['GRANT INSERT ON `ai\\_stats`.* TO `u`@`%`'], 'aiXstats')).toBe(false);
+  });
+
+  it('未转义的 % / _ 按 LIKE 通配符匹配', () => {
+    expect(hasInsertGrant(['GRANT INSERT ON `ai%`.* TO `u`@`%`'], 'ai_stats')).toBe(true);
+    expect(hasInsertGrant(['GRANT INSERT ON `ai_stats`.* TO `u`@`%`'], 'aiXstats')).toBe(true);
+  });
+
+  it('列级 INSERT 不算表级 INSERT', () => {
+    expect(hasInsertGrant(['GRANT INSERT (col1) ON `ai_stats`.`ai_commit` TO `u`@`%`'], 'ai_stats')).toBe(false);
+    expect(hasInsertGrant([
+      'GRANT INSERT (col1) ON `ai_stats`.`ai_commit` TO `u`@`%`',
+      'GRANT INSERT ON `ai_stats`.`ai_commit_file` TO `u`@`%`',
+      'GRANT INSERT ON `ai_stats`.`ai_commit_tool` TO `u`@`%`',
+    ], 'ai_stats')).toBe(false);
+  });
+
+  it('列级 INSERT 不影响库级/全局判断（仍可被其他行满足）', () => {
+    expect(hasInsertGrant([
+      'GRANT INSERT (col1) ON `ai_stats`.`ai_commit` TO `u`@`%`',
+      'GRANT INSERT ON `ai_stats`.* TO `u`@`%`',
+    ], 'ai_stats')).toBe(true);
+  });
 });
 
 describe('testMysql', () => {
@@ -128,6 +156,45 @@ describe('testMysql', () => {
 });
 
 describe('runMysqlWizard', () => {
+  it('全局配置损坏时，先失败退出且不问任何问题、不写入', async () => {
+    fs.mkdirSync(path.dirname(configPath()), { recursive: true });
+    fs.writeFileSync(configPath(), '{bad json');
+    const before = fs.readFileSync(configPath(), 'utf8');
+    const { prompter, log } = fakePrompter({});
+    const { probe } = fakeProbe();
+    const code = await runMysqlWizard(prompter, probe);
+    expect(code).toBe(1);
+    expect(log).toEqual([]); // 未问任何问题
+    expect(fs.readFileSync(configPath(), 'utf8')).toBe(before); // 未被改写
+  });
+
+  it('已有保存的密码时才显示"留空沿用已保存的密码"提示，否则只问"密码"', async () => {
+    // 无已保存密码
+    {
+      const { prompter, log } = fakePrompter({
+        ask: ['host', '3306', 'db', 'user'],
+        askSecret: ['pw'],
+      });
+      const { probe } = fakeProbe({ grants: ['GRANT ALL PRIVILEGES ON *.* TO `u`@`%`'] });
+      await runMysqlWizard(prompter, probe);
+      expect(log).toContain('askSecret:密码');
+      expect(log.some((l) => l.startsWith('askSecret:密码（'))).toBe(false);
+    }
+    // 有已保存密码
+    {
+      updateGlobalConfig((raw) => {
+        raw.reporter = { type: 'mysql', options: { host: 'h', port: 3306, user: 'u', password: 'old-pw', database: 'd' } };
+      });
+      const { prompter, log } = fakePrompter({
+        ask: ['host', '3306', 'db', 'user'],
+        askSecret: [''],
+      });
+      const { probe } = fakeProbe({ grants: ['GRANT ALL PRIVILEGES ON *.* TO `u`@`%`'] });
+      await runMysqlWizard(prompter, probe);
+      expect(log).toContain('askSecret:密码（留空沿用已保存的密码）');
+    }
+  });
+
   it('成功路径：写入全局配置 reporter=mysql，保留其他字段，文件权限 600', async () => {
     updateGlobalConfig((raw) => {
       raw.owner = { name: 'Someone' };

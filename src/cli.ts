@@ -173,7 +173,12 @@ async function config(args: string[]): Promise<number> {
     console.error('请在交互终端中运行 aicode config mysql');
     return 1;
   }
-  return runMysqlWizard(createTtyPrompter(), defaultProbe);
+  const prompter = createTtyPrompter();
+  try {
+    return await runMysqlWizard(prompter, defaultProbe);
+  } finally {
+    prompter.close?.();
+  }
 }
 
 async function main(args: string[]): Promise<number> {

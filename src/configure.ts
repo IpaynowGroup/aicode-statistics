@@ -1,16 +1,27 @@
 import readline from 'node:readline';
-import { readGlobalConfig, updateGlobalConfig, type ReporterConfig } from './config.js';
+import { assertGlobalConfigWritable, readGlobalConfig, updateGlobalConfig, type ReporterConfig } from './config.js';
 import type { MysqlOptions } from './reporter/mysql.js';
 
 export interface Prompter {
   ask(question: string, def?: string): Promise<string>;
   askSecret(question: string): Promise<string>;
   confirm(question: string): Promise<boolean>;
+  /** 可选：释放底层资源（如 readline 接口），正常结束时调用 */
+  close?(): void;
 }
 
-/** 基于 readline 的交互式 Prompter：ask 展示默认值、空输入回车沿用默认值；askSecret 不回显输入 */
+/**
+ * 基于 readline 的交互式 Prompter：ask 展示默认值、空输入回车沿用默认值；askSecret 不回显输入；
+ * historySize:0 关闭输入历史，避免密码可通过方向键（↑）从历史记录中被翻出来；
+ * Ctrl+C 时打印换行后以 130（128+SIGINT）退出，不写入任何配置。
+ */
 export function createTtyPrompter(): Prompter {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, historySize: 0 });
+  rl.on('SIGINT', () => {
+    process.stdout.write('\n');
+    rl.close();
+    process.exit(130);
+  });
   return {
     ask(question, def) {
       const suffix = def ? `（默认 ${def}）` : '';
@@ -22,22 +33,32 @@ export function createTtyPrompter(): Prompter {
     },
     askSecret(question) {
       return new Promise((resolve) => {
-        // 借用 readline 内部的行编辑（支持退格），只是拦截输出以不回显字符
+        // 借用 readline 内部的行编辑（支持退格），只是拦截输出以不回显字符；
+        // 退格会触发整行重绘（含提示语本身），命中提示语前缀时只重写提示语本身，避免提示语被吞掉/擦除
         const rlInternal = rl as unknown as { _writeToOutput: (s: string) => void; output: NodeJS.WritableStream };
         const originalWrite = rlInternal._writeToOutput.bind(rlInternal);
-        let promptWritten = false;
+        const promptText = `${question}: `;
+        let active = false;
         rlInternal._writeToOutput = (stringToWrite: string) => {
-          if (!promptWritten) {
+          if (!active) {
             originalWrite(stringToWrite);
             return;
           }
-          if (stringToWrite === '\r\n' || stringToWrite === '\n') originalWrite(stringToWrite);
+          if (stringToWrite === '\r\n' || stringToWrite === '\n') {
+            originalWrite(stringToWrite);
+            return;
+          }
+          if (stringToWrite.startsWith(promptText)) {
+            originalWrite(promptText);
+            return;
+          }
+          // 其余重绘（清屏、移动光标、回显字符等）一律吞掉
         };
-        rl.question(`${question}: `, (answer) => {
+        rl.question(promptText, (answer) => {
           rlInternal._writeToOutput = originalWrite;
           resolve(answer);
         });
-        promptWritten = true;
+        active = true;
       });
     },
     confirm(question) {
@@ -46,6 +67,9 @@ export function createTtyPrompter(): Prompter {
           resolve(/^y(es)?$/i.test(answer.trim()));
         });
       });
+    },
+    close() {
+      rl.close();
     },
   };
 }
@@ -81,9 +105,37 @@ function parseScope(scope: string): { db: string; table: string } {
   return { db: stripped.slice(0, idx), table: stripped.slice(idx + 1) };
 }
 
+function escapeRegExp(ch: string): string {
+  return ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * MySQL 的库级授权作用域按 LIKE 模式匹配：未转义的 % / _ 是通配符，`\%`、`\_` 表示字面量。
+ * `*` 单独出现表示全局（*.*），直接判定匹配所有库。
+ */
+function dbScopeMatches(scopeDb: string, database: string): boolean {
+  if (scopeDb === '*') return true;
+  let pattern = '';
+  for (let i = 0; i < scopeDb.length; i++) {
+    const c = scopeDb[i];
+    if (c === '\\' && i + 1 < scopeDb.length && (scopeDb[i + 1] === '_' || scopeDb[i + 1] === '%' || scopeDb[i + 1] === '\\')) {
+      pattern += escapeRegExp(scopeDb[i + 1]);
+      i++;
+    } else if (c === '%') {
+      pattern += '.*';
+    } else if (c === '_') {
+      pattern += '.';
+    } else {
+      pattern += escapeRegExp(c);
+    }
+  }
+  return new RegExp(`^${pattern}$`, 'i').test(database);
+}
+
 /**
  * 判断 SHOW GRANTS 的结果是否已具备写入所需的 INSERT 权限：
- * 全局 / 库级 ALL PRIVILEGES 或 INSERT 均视为满足；否则要求对三张目标表分别持有 INSERT。
+ * 全局 / 库级 ALL PRIVILEGES 或 INSERT 均视为满足；否则要求对三张目标表分别持有（表级，非列级）INSERT。
+ * 列级授权如 `INSERT (col)` 不满足要求，因为不保证能写入全部所需列。
  */
 export function hasInsertGrant(grants: string[], database: string): boolean {
   const tablesWithInsert = new Set<string>();
@@ -92,10 +144,10 @@ export function hasInsertGrant(grants: string[], database: string): boolean {
     if (!m) continue;
     const privs = m[1].toUpperCase();
     const { db, table } = parseScope(m[2]);
-    const dbMatches = db === '*' || db.toLowerCase() === database.toLowerCase();
-    if (!dbMatches) continue;
+    if (!dbScopeMatches(db, database)) continue;
     const isAll = /\bALL PRIVILEGES\b/.test(privs) || /(^|,)\s*ALL\s*(,|$)/.test(privs);
-    const hasInsert = /\bINSERT\b/.test(privs);
+    // 列级 INSERT（如 "INSERT (col1, col2)"）不算表级 INSERT：INSERT 后紧跟 "(" 时排除
+    const hasInsert = /\bINSERT\b(?!\s*\()/.test(privs);
     if (table === '*') {
       if (isAll || hasInsert) return true;
       continue;
@@ -133,6 +185,14 @@ export async function testMysql(opts: MysqlOptions, probe: MysqlProbe): Promise<
 
 /** 交互式配置 MySQL 上报；返回值作为进程退出码 */
 export async function runMysqlWizard(prompter: Prompter, probe: MysqlProbe): Promise<number> {
+  // 与 updateGlobalConfig 用同一严格校验：配置已损坏时先失败退出，不问任何问题、不尝试写入
+  try {
+    assertGlobalConfigWritable();
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    return 1;
+  }
+
   const existing = readGlobalConfig();
   const existingReporter = existing.reporter as ReporterConfig | undefined;
   const defaults = existingReporter && existingReporter.type === 'mysql' && existingReporter.options
@@ -176,7 +236,8 @@ export async function runMysqlWizard(prompter: Prompter, probe: MysqlProbe): Pro
     return 1;
   }
 
-  const passwordInput = await prompter.askSecret('密码（留空沿用已保存的密码）');
+  const passwordQuestion = existingPassword ? '密码（留空沿用已保存的密码）' : '密码';
+  const passwordInput = await prompter.askSecret(passwordQuestion);
   const password = passwordInput === '' ? existingPassword : passwordInput;
 
   console.log('正在测试连接…');
