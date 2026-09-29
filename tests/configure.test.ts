@@ -3,13 +3,14 @@ import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { readGlobalConfig, updateGlobalConfig } from '../src/config.js';
 import {
-  disableMysql, hasInsertGrant, runMysqlWizard, testMysql, type MysqlProbe, type Prompter,
+  disableMysql, hasInsertGrant, runMysqlWizard, testMysql, WizardEofError, type MysqlProbe, type Prompter,
 } from '../src/configure.js';
 import { configPath } from '../src/paths.js';
 import { tmpHome } from './helpers.js';
 
 beforeEach(() => {
   tmpHome();
+  delete process.env.AICODE_MYSQL_PASSWORD;
 });
 
 // ---- 假 Prompter：脚本化回答；ask 遵循真实 createTtyPrompter 的约定——空字符串表示回车，取默认值 ----
@@ -308,5 +309,87 @@ describe('disableMysql', () => {
     const cfg = readGlobalConfig();
     expect(cfg.reporter).toEqual({ type: 'noop' });
     expect(cfg.owner).toEqual({ name: 'Someone' });
+  });
+
+  it('原 type=mysql 时返回"已关闭 MySQL 上报"', () => {
+    updateGlobalConfig((raw) => {
+      raw.reporter = { type: 'mysql', options: { host: 'h', port: 3306, user: 'u', database: 'd' } };
+    });
+    expect(disableMysql()).toBe('已关闭 MySQL 上报');
+  });
+
+  it('原 type 为其他非 noop 类型时返回带 type 的提示', () => {
+    updateGlobalConfig((raw) => {
+      raw.reporter = { type: 'module', module: '/abs/x.mjs' };
+    });
+    expect(disableMysql()).toBe('已关闭上报（原 type=module）');
+  });
+
+  it('已经是 noop 时返回"当前未启用上报"，且不写入文件', () => {
+    expect(disableMysql()).toBe('当前未启用上报'); // 配置文件此时都还不存在
+    expect(fs.existsSync(configPath())).toBe(false);
+
+    updateGlobalConfig((raw) => {
+      raw.reporter = { type: 'noop' };
+      raw.owner = { name: 'kept' };
+    });
+    const before = fs.readFileSync(configPath(), 'utf8');
+    expect(disableMysql()).toBe('当前未启用上报');
+    expect(fs.readFileSync(configPath(), 'utf8')).toBe(before);
+  });
+});
+
+describe('runMysqlWizard 识别 AICODE_MYSQL_PASSWORD 环境变量', () => {
+  it('设置了环境变量时：打印提示、跳过密码询问、用环境变量值测试连接、配置中不写入该值', async () => {
+    process.env.AICODE_MYSQL_PASSWORD = 'env-secret';
+    const { prompter, log } = fakePrompter({ ask: ['h', '3306', 'd', 'u'] });
+    let usedPassword: string | undefined;
+    const probe: MysqlProbe = {
+      async connect(opts) {
+        usedPassword = opts.password;
+        return {
+          async query(sql) {
+            if (sql.startsWith('SHOW GRANTS')) return [{ g: 'GRANT ALL PRIVILEGES ON *.* TO `u`@`%`' }];
+            return [];
+          },
+          async end() {},
+        };
+      },
+    };
+    const code = await runMysqlWizard(prompter, probe);
+    expect(code).toBe(0);
+    expect(log.some((l) => l.startsWith('askSecret'))).toBe(false); // 没有问密码
+    expect(usedPassword).toBe('env-secret');
+    const cfg = readGlobalConfig();
+    const options = (cfg.reporter as { options: { password?: string } }).options;
+    expect(options.password).toBeUndefined(); // 环境变量的值不写入配置文件
+  });
+
+  it('设置了环境变量、且配置里已有旧密码时：旧密码原样保留在配置中，不被环境变量覆盖', async () => {
+    updateGlobalConfig((raw) => {
+      raw.reporter = { type: 'mysql', options: { host: 'h', port: 3306, user: 'u', database: 'd', password: 'old-pw' } };
+    });
+    process.env.AICODE_MYSQL_PASSWORD = 'env-secret';
+    const { prompter } = fakePrompter({ ask: ['', '', '', ''] });
+    const { probe } = fakeProbe({ grants: ['GRANT ALL PRIVILEGES ON *.* TO `u`@`%`'] });
+    const code = await runMysqlWizard(prompter, probe);
+    expect(code).toBe(0);
+    const cfg = readGlobalConfig();
+    expect((cfg.reporter as { options: { password?: string } }).options.password).toBe('old-pw');
+  });
+});
+
+describe('runMysqlWizard 在等待输入时遇到 EOF（Ctrl+D）', () => {
+  it('返回 1，不写入任何配置', async () => {
+    const before = fs.existsSync(configPath()) ? fs.readFileSync(configPath(), 'utf8') : null;
+    const prompter: Prompter = {
+      ask: () => Promise.reject(new WizardEofError()),
+      askSecret: () => Promise.reject(new WizardEofError()),
+      confirm: () => Promise.reject(new WizardEofError()),
+    };
+    const { probe } = fakeProbe();
+    const code = await runMysqlWizard(prompter, probe);
+    expect(code).toBe(1);
+    expect(fs.existsSync(configPath()) ? fs.readFileSync(configPath(), 'utf8') : null).toBe(before);
   });
 });

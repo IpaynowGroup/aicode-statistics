@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { readGlobalConfig, updateGlobalConfig } from '../src/config.js';
 import { repoId } from '../src/git.js';
 import { configPath } from '../src/paths.js';
@@ -58,6 +58,16 @@ describe('updateGlobalConfig', () => {
     });
     expect(fs.existsSync(`${configPath()}.tmp`)).toBe(false);
     expect(fs.statSync(configPath()).mode & 0o777).toBe(0o600);
+  });
+
+  it('临时文件名带上当前进程 pid，避免并发写入者互相覆盖（控制器裁定）', () => {
+    const writeSpy = vi.spyOn(fs, 'writeFileSync');
+    updateGlobalConfig((raw) => {
+      raw.track = { mode: 'list', repos: ['z'] };
+    });
+    const tmpPathUsed = writeSpy.mock.calls.map((c) => c[0]).find((p) => typeof p === 'string' && p.includes('.tmp'));
+    expect(tmpPathUsed).toBe(`${configPath()}.${process.pid}.tmp`);
+    writeSpy.mockRestore();
   });
 });
 

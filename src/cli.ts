@@ -194,8 +194,7 @@ async function config(args: string[]): Promise<number> {
     }
   }
   if (flags.includes('--disable')) {
-    disableMysql();
-    console.log('已关闭 MySQL 上报');
+    console.log(disableMysql());
     return 0;
   }
   if (!process.stdin.isTTY) {

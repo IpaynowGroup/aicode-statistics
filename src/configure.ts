@@ -15,24 +15,44 @@ export interface Prompter {
  * historySize:0 关闭输入历史，避免密码可通过方向键（↑）从历史记录中被翻出来；
  * Ctrl+C 时打印换行后以 130（128+SIGINT）退出，不写入任何配置。
  */
+/** readline 在 Ctrl+D（EOF）时关闭输入流而不触发 question 的回调；用该错误标记这种情况，供 runMysqlWizard 识别 */
+export class WizardEofError extends Error {
+  constructor() {
+    super('EOF');
+  }
+}
+
 export function createTtyPrompter(): Prompter {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, historySize: 0 });
+  // 有 question 等待回答时非空；rl 在提问期间关闭（Ctrl+D）说明用户想退出，而不是给出了空答案
+  let pendingReject: ((err: Error) => void) | null = null;
   rl.on('SIGINT', () => {
     process.stdout.write('\n');
     rl.close();
     process.exit(130);
   });
+  rl.on('close', () => {
+    const reject = pendingReject;
+    pendingReject = null;
+    if (reject) {
+      process.stdout.write('\n');
+      reject(new WizardEofError());
+    }
+  });
   return {
     ask(question, def) {
       const suffix = def ? `（默认 ${def}）` : '';
-      return new Promise((resolve) => {
+      return new Promise((resolve, reject) => {
+        pendingReject = reject;
         rl.question(`${question}${suffix}: `, (answer) => {
+          pendingReject = null;
           resolve(answer.trim() || def || '');
         });
       });
     },
     askSecret(question) {
-      return new Promise((resolve) => {
+      return new Promise((resolve, reject) => {
+        pendingReject = reject;
         // 借用 readline 内部的行编辑（支持退格），只是拦截输出以不回显字符；
         // 退格会触发整行重绘（含提示语本身），命中提示语前缀时只重写提示语本身，避免提示语被吞掉/擦除
         const rlInternal = rl as unknown as { _writeToOutput: (s: string) => void; output: NodeJS.WritableStream };
@@ -56,14 +76,17 @@ export function createTtyPrompter(): Prompter {
         };
         rl.question(promptText, (answer) => {
           rlInternal._writeToOutput = originalWrite;
+          pendingReject = null;
           resolve(answer);
         });
         active = true;
       });
     },
     confirm(question) {
-      return new Promise((resolve) => {
+      return new Promise((resolve, reject) => {
+        pendingReject = reject;
         rl.question(question, (answer) => {
+          pendingReject = null;
           resolve(/^y(es)?$/i.test(answer.trim()));
         });
       });
@@ -203,64 +226,84 @@ export async function runMysqlWizard(prompter: Prompter, probe: MysqlProbe): Pro
   const defaultDatabase = typeof defaults.database === 'string' ? defaults.database : undefined;
   const defaultUser = typeof defaults.user === 'string' ? defaults.user : undefined;
   const existingPassword = typeof defaults.password === 'string' ? defaults.password : undefined;
+  // 与内置 MySQL Reporter（resolveMysqlOptions）同样的优先级：设置了该环境变量时，上报永远用它，配置文件里的密码不生效
+  const envPassword = process.env.AICODE_MYSQL_PASSWORD;
+  if (envPassword) console.log('检测到环境变量 AICODE_MYSQL_PASSWORD，上报时将优先使用它');
 
-  const host = await prompter.ask('MySQL 主机', defaultHost);
-  if (!host) {
-    console.error('host 不能为空');
-    return 1;
-  }
-
-  let port: number | undefined;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const portInput = await prompter.ask('端口', defaultPort);
-    const n = Number(portInput);
-    if (Number.isInteger(n) && n >= 1 && n <= 65535) {
-      port = n;
-      break;
-    }
-    if (attempt === 1) {
-      console.error('端口必须是 1-65535 之间的整数');
+  try {
+    const host = await prompter.ask('MySQL 主机', defaultHost);
+    if (!host) {
+      console.error('host 不能为空');
       return 1;
     }
+
+    let port: number | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const portInput = await prompter.ask('端口', defaultPort);
+      const n = Number(portInput);
+      if (Number.isInteger(n) && n >= 1 && n <= 65535) {
+        port = n;
+        break;
+      }
+      if (attempt === 1) {
+        console.error('端口必须是 1-65535 之间的整数');
+        return 1;
+      }
+    }
+
+    const database = await prompter.ask('数据库名', defaultDatabase);
+    if (!database) {
+      console.error('database 不能为空');
+      return 1;
+    }
+
+    const user = await prompter.ask('用户名', defaultUser);
+    if (!user) {
+      console.error('user 不能为空');
+      return 1;
+    }
+
+    // 设置了环境变量密码时不再询问，直接沿用（或没有）已保存的密码写回配置，用环境变量的值做连接测试
+    let password = existingPassword;
+    if (!envPassword) {
+      const passwordQuestion = existingPassword ? '密码（留空沿用已保存的密码）' : '密码';
+      const passwordInput = await prompter.askSecret(passwordQuestion);
+      password = passwordInput === '' ? existingPassword : passwordInput;
+    }
+
+    console.log('正在测试连接…');
+    const opts: MysqlOptions = { host, port: port as number, user, password: envPassword ?? password, database, connectTimeout: 5000 };
+    const result = await testMysql(opts, probe);
+    if (result.ok) {
+      console.log('连接成功，已具备 INSERT 权限');
+    } else {
+      console.log(result.message);
+      const proceed = await prompter.confirm('仍然保存？[y/N] ');
+      if (!proceed) return 1;
+    }
+
+    updateGlobalConfig((raw) => {
+      raw.reporter = { type: 'mysql', options: { host, port, user, password, database } };
+    });
+    console.log('已保存到 ~/.aicode/config.json（权限 600）');
+    return 0;
+  } catch (err) {
+    if (err instanceof WizardEofError) return 1; // 已在 prompter 里打印换行，这里不再多输出
+    throw err;
   }
-
-  const database = await prompter.ask('数据库名', defaultDatabase);
-  if (!database) {
-    console.error('database 不能为空');
-    return 1;
-  }
-
-  const user = await prompter.ask('用户名', defaultUser);
-  if (!user) {
-    console.error('user 不能为空');
-    return 1;
-  }
-
-  const passwordQuestion = existingPassword ? '密码（留空沿用已保存的密码）' : '密码';
-  const passwordInput = await prompter.askSecret(passwordQuestion);
-  const password = passwordInput === '' ? existingPassword : passwordInput;
-
-  console.log('正在测试连接…');
-  const opts: MysqlOptions = { host, port: port as number, user, password, database, connectTimeout: 5000 };
-  const result = await testMysql(opts, probe);
-  if (result.ok) {
-    console.log('连接成功，已具备 INSERT 权限');
-  } else {
-    console.log(result.message);
-    const proceed = await prompter.confirm('仍然保存？[y/N] ');
-    if (!proceed) return 1;
-  }
-
-  updateGlobalConfig((raw) => {
-    raw.reporter = { type: 'mysql', options: { host, port, user, password, database } };
-  });
-  console.log('已保存到 ~/.aicode/config.json（权限 600）');
-  return 0;
 }
 
-/** 把全局 reporter 改为 noop，关闭 MySQL 上报 */
-export function disableMysql(): void {
+/**
+ * 把全局 reporter 改为 noop，关闭上报；已经是 noop 时不写入（返回提示，调用方据此打印）。
+ * 返回值区分原状态：mysql / 其他非 noop 类型 / 本就是 noop。
+ */
+export function disableMysql(): string {
+  const existing = readGlobalConfig();
+  const existingReporter = existing.reporter as ReporterConfig | undefined;
+  const type = existingReporter?.type ?? 'noop';
+  if (type === 'noop') return '当前未启用上报';
   updateGlobalConfig((raw) => {
     raw.reporter = { type: 'noop' };
   });
+  return type === 'mysql' ? '已关闭 MySQL 上报' : `已关闭上报（原 type=${type}）`;
 }

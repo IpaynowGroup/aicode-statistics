@@ -141,7 +141,8 @@ export function updateGlobalConfig(mutate: (raw: Record<string, unknown>) => voi
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true });
   fs.chmodSync(dir, 0o700);
-  const tmp = `${file}.tmp`;
+  // 临时文件名带上 pid，避免并发写入者互相覆盖对方的临时文件
+  const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(raw, null, 2) + '\n', { mode: 0o600 });
   fs.chmodSync(tmp, 0o600);
   fs.renameSync(tmp, file);
