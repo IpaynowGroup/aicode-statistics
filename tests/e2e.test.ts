@@ -140,6 +140,36 @@ describe('端到端', () => {
     expect(fs.existsSync(path.join(home, '.claude', 'settings.json'))).toBe(false); // 由 aicode 创建，卸载时删除
   });
 
+  it('aicode status 退出 0 且输出含积压条数', () => {
+    expect(run(['init', '--yes']).status).toBe(0);
+    const r = run(['status']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('积压');
+  });
+
+  it('aicode sync：配置一个必然失败的 module reporter 后退出 1 且输出含失败原因', async () => {
+    expect(run(['init', '--yes']).status).toBe(0);
+    const modFile = path.join(home, 'failing-reporter.mjs');
+    fs.writeFileSync(
+      modFile,
+      "export default () => ({ name: 'file', async report() { throw new Error('网关不可用'); } });\n",
+    );
+    const configFile = path.join(home, '.aicode', 'config.json');
+    const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    config.reporter = { type: 'module', module: modFile };
+    fs.writeFileSync(configFile, JSON.stringify(config));
+
+    const repo = initRepo();
+    sh(repo, ['remote', 'add', 'origin', 'git@gitlab.example.com:group/sync-fail.git']);
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+    const sha = commitAll(repo, 'feat: sync fail');
+    await waitForEvent(sha);
+
+    const r = run(['sync']);
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain('失败原因');
+  });
+
   it('aicode track / untrack / track --list', () => {
     run(['init', '--yes']);
     const repo = initRepo();

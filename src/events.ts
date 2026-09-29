@@ -59,3 +59,8 @@ export function readUnreported(limit: number): CommitEvent[] {
 export function markReported(eventId: string): void {
   appendJsonl(reportedPath(), { event_id: eventId });
 }
+
+export function countUnreported(): number {
+  const reported = new Set(readJsonl<{ event_id: string }>(reportedPath()).map((r) => r.event_id));
+  return readJsonl<CommitEvent>(eventsPath()).filter((e) => !reported.has(e.event_id)).length;
+}

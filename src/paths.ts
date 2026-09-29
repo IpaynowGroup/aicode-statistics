@@ -14,3 +14,4 @@ export const installStatePath = (): string => path.join(aicodeHome(), 'install-s
 export const claudeSettingsPath = (): string =>
   path.join(process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), '.claude'), 'settings.json');
 export const codexHome = (): string => process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
+export const syncStatePath = (): string => path.join(aicodeHome(), 'sync-state.json');

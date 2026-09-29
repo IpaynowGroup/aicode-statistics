@@ -39,19 +39,28 @@ export async function loadReporter(cfg: ReporterConfig): Promise<Reporter> {
   return mod.default(cfg.options ?? {});
 }
 
+export interface FlushResult { sent: number; failed: boolean; error?: string }
+
 /** 按顺序补发未上报事件；遇到失败即停止，保证不乱序；结束时关闭 reporter */
-export async function flushEvents(reporter: Reporter, limit = 50): Promise<void> {
+export async function flushEvents(reporter: Reporter, limit = 50): Promise<FlushResult> {
+  let sent = 0;
+  let failed = false;
+  let error: string | undefined;
   try {
     for (const event of readUnreported(limit)) {
       try {
         await reporter.report(event);
         markReported(event.event_id);
+        sent++;
       } catch (err) {
         logError(`report ${reporter.name}`, err);
-        return;
+        failed = true;
+        error = err instanceof Error ? err.message : String(err);
+        break;
       }
     }
   } finally {
     await reporter.close?.().catch((err) => logError(`close ${reporter.name}`, err));
   }
+  return { sent, failed, error };
 }

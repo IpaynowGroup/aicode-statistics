@@ -5,7 +5,8 @@ import { commitDiff, commitInfo, currentBranch, isAmend, repoId, repoKey, repoRo
 import { buildIgnore } from './ignore.js';
 import { readRecords, withLock, writeRecords } from './ledger.js';
 import { commitModule, createModuleResolver, resolveOwner } from './metadata.js';
-import { flushEvents, loadReporter } from './reporter/index.js';
+import { loadReporter } from './reporter/index.js';
+import { autoSync } from './sync.js';
 import { isRepoTracked } from './track.js';
 import { VERSION } from './version.js';
 
@@ -59,6 +60,6 @@ export async function runCommit(cwd: string, opts?: RunCommitOptions): Promise<C
     return e;
   });
   if (!event) return null;
-  await flushEvents(await loadReporter(config.reporter));
+  await autoSync(await loadReporter(config.reporter));
   return event;
 }

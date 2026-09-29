@@ -1,10 +1,13 @@
 #!/usr/bin/env node
 import readline from 'node:readline';
 import { runCommit } from './commit.js';
+import { loadConfig } from './config.js';
 import { repoRoot } from './git.js';
 import { runHook } from './hook.js';
 import { planGlobal, planProject } from './init.js';
 import { logError } from './log.js';
+import { loadReporter } from './reporter/index.js';
+import { describeStatus, syncAll } from './sync.js';
 import { describeTrack, setTrackAll, trackRepo, untrackRepo } from './track.js';
 
 const USAGE = [
@@ -14,6 +17,8 @@ const USAGE = [
   '  aicode commit                                   由 post-commit 调用',
   '  aicode track [--all|--list]                     把当前仓库加入统计名单 / 恢复统计所有仓库 / 查看名单',
   '  aicode untrack                                  把当前仓库移出统计名单',
+  '  aicode sync                                     手动补发本地积压事件',
+  '  aicode status                                   查看统计模式、reporter 与同步状态',
 ].join('\n');
 
 /** 解析 `--name value` 形式的参数；未传或值为空字符串时视为缺省 */
@@ -114,6 +119,27 @@ function untrack(flags: string[]): number {
   return 0;
 }
 
+async function sync(): Promise<number> {
+  const config = loadConfig(null);
+  const reporter = await loadReporter(config.reporter);
+  const result = await syncAll(reporter);
+  if (reporter.name === 'noop') {
+    console.log(`未配置上报（reporter=noop），${result.remaining} 条事件保留在本地队列，配置后执行 aicode sync 即可补发`);
+    return 0;
+  }
+  console.log(`已上报 ${result.sent} 条，剩余 ${result.remaining} 条`);
+  if (result.error) {
+    console.log(`失败原因：${result.error}`);
+    return 1;
+  }
+  return 0;
+}
+
+function status(): number {
+  console.log(describeStatus(loadConfig(null)));
+  return 0;
+}
+
 async function main(args: string[]): Promise<number> {
   const [cmd, ...rest] = args;
   if (cmd === 'init') {
@@ -137,6 +163,22 @@ async function main(args: string[]): Promise<number> {
       return untrack(rest);
     } catch (err) {
       console.error(`aicode untrack 失败: ${err instanceof Error ? err.message : String(err)}`);
+      return 1;
+    }
+  }
+  if (cmd === 'sync') {
+    try {
+      return await sync();
+    } catch (err) {
+      console.error(`aicode sync 失败: ${err instanceof Error ? err.message : String(err)}`);
+      return 1;
+    }
+  }
+  if (cmd === 'status') {
+    try {
+      return status();
+    } catch (err) {
+      console.error(`aicode status 失败: ${err instanceof Error ? err.message : String(err)}`);
       return 1;
     }
   }
