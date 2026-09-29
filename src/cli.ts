@@ -2,6 +2,7 @@
 import readline from 'node:readline';
 import { runCommit } from './commit.js';
 import { loadConfig } from './config.js';
+import { createTtyPrompter, defaultProbe, disableMysql, runMysqlWizard } from './configure.js';
 import { countUnreported } from './events.js';
 import { repoRoot } from './git.js';
 import { runHook } from './hook.js';
@@ -20,6 +21,7 @@ const USAGE = [
   '  aicode untrack                                  把当前仓库移出统计名单',
   '  aicode sync                                     手动补发本地积压事件',
   '  aicode status                                   查看统计模式、reporter 与同步状态',
+  '  aicode config mysql [--disable]                 交互式配置 / 关闭 MySQL 上报',
 ].join('\n');
 
 /** 解析 `--name value` 形式的参数；未传或值为空字符串时视为缺省 */
@@ -147,6 +149,33 @@ function status(): number {
   return 0;
 }
 
+async function config(args: string[]): Promise<number> {
+  const [sub, ...flags] = args;
+  if (sub !== 'mysql') {
+    console.error(`未知参数: ${sub ?? ''}`);
+    console.error(USAGE);
+    return 1;
+  }
+  const allowedFlags = new Set(['--disable']);
+  for (const flag of flags) {
+    if (!allowedFlags.has(flag)) {
+      console.error(`未知参数: ${flag}`);
+      console.error(USAGE);
+      return 1;
+    }
+  }
+  if (flags.includes('--disable')) {
+    disableMysql();
+    console.log('已关闭 MySQL 上报');
+    return 0;
+  }
+  if (!process.stdin.isTTY) {
+    console.error('请在交互终端中运行 aicode config mysql');
+    return 1;
+  }
+  return runMysqlWizard(createTtyPrompter(), defaultProbe);
+}
+
 async function main(args: string[]): Promise<number> {
   const [cmd, ...rest] = args;
   if (cmd === 'init') {
@@ -186,6 +215,14 @@ async function main(args: string[]): Promise<number> {
       return status();
     } catch (err) {
       console.error(`aicode status 失败: ${err instanceof Error ? err.message : String(err)}`);
+      return 1;
+    }
+  }
+  if (cmd === 'config') {
+    try {
+      return await config(rest);
+    } catch (err) {
+      console.error(`aicode config 失败: ${err instanceof Error ? err.message : String(err)}`);
       return 1;
     }
   }
