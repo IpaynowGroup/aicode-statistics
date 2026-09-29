@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { writeDefaultConfig } from './config.js';
+import { assertGlobalConfigWritable, writeDefaultConfig } from './config.js';
 import { gitCommonDir, isTracked, localHooksPath, repoRoot } from './git.js';
 import { installClaude, uninstallClaude } from './installer/claude.js';
 import { installCodex, installProjectCodex, isCodexTrusted, uninstallCodex, uninstallProjectCodex } from './installer/codex.js';
@@ -94,6 +94,10 @@ export function planProject(cwd: string, uninstall: boolean): Plan {
     steps.push({ file: configPath(), summary: '把当前仓库移出统计名单', apply: () => removeFromTrackList(root) });
     return { steps, notes };
   }
+
+  // 提前校验全局配置可安全解析：最后一步 addToTrackList 需要写全局配置，配置损坏时须在这里中止，
+  // 避免 Claude/Codex/exclude/post-commit 已经 apply 之后才失败（见控制器裁定）
+  assertGlobalConfigWritable();
 
   // 提前检测 post-commit 冲突：已被其他工具替换且存在旧备份时中止，不写入任何文件（见 R4）
   if (hasForeignPostCommitConflict(root)) {

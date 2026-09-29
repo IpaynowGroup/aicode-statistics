@@ -58,6 +58,21 @@ describe('loadConfig', () => {
     expect(loadConfig(null).reporter).toEqual({ type: 'noop' });
   });
 
+  it('全局配置顶层不是普通对象（如 null）时忽略该文件而不是抛错', () => {
+    fs.mkdirSync(path.dirname(configPath()), { recursive: true });
+    fs.writeFileSync(configPath(), 'null');
+    expect(loadConfig(null)).toEqual({
+      owner: undefined, modules: [], ignore: [], reporter: { type: 'noop' }, track: { mode: 'all', repos: [] },
+    });
+  });
+
+  it('仓库级 .aicode.json 顶层不是普通对象（如数组）时忽略该文件', () => {
+    writeDefaultConfig();
+    const repo = initRepo();
+    fs.writeFileSync(path.join(repo, '.aicode.json'), '[1,2,3]');
+    expect(loadConfig(repo).modules).toEqual([]);
+  });
+
   it('字段类型错误时忽略该字段并记日志，不影响其他字段（见 F8）', () => {
     fs.mkdirSync(path.dirname(configPath()), { recursive: true });
     fs.writeFileSync(configPath(), JSON.stringify({ owner: 'not-an-object', modules: 'not-an-array', ignore: { a: 1 }, reporter: { type: 'noop' } }));

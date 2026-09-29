@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { readGlobalConfig } from '../src/config.js';
 import { repoId } from '../src/git.js';
 import { planGlobal, planProject } from '../src/init.js';
+import { configPath } from '../src/paths.js';
 import { commitAll, initRepo, sh, tmpHome } from './helpers.js';
 
 let home: string;
@@ -148,6 +149,21 @@ describe('planProject', () => {
     expect(fs.existsSync(path.join(repo, '.claude'))).toBe(false);
     expect(fs.readFileSync(hookFile, 'utf8')).toContain('echo mine');
     expect(fs.readFileSync(hookFile + '.aicode-orig', 'utf8')).toContain('echo stale-backup');
+  });
+
+  it('全局配置损坏时，planProject(..., false) 在返回任何步骤前抛错，不写入任何文件（不会先 apply Claude/Codex/exclude/post-commit 再在最后一步失败）', () => {
+    const repo = initRepo();
+    fs.mkdirSync(path.join(home, '.codex'));
+    fs.writeFileSync(path.join(home, '.codex', 'config.toml'), 'model = "x"\n');
+    fs.mkdirSync(path.dirname(configPath()), { recursive: true });
+    const corrupt = '{ "reporter": { "type": "mysql", "options": { "password": "secret" } }, }';
+    fs.writeFileSync(configPath(), corrupt);
+
+    expect(() => planProject(repo, false)).toThrow('解析失败');
+    expect(fs.existsSync(path.join(repo, '.claude'))).toBe(false);
+    expect(fs.existsSync(path.join(repo, '.git', 'hooks', 'post-commit'))).toBe(false);
+    expect(fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8')).toBe('model = "x"\n');
+    expect(fs.readFileSync(configPath(), 'utf8')).toBe(corrupt);
   });
 
   it('跳过已被 git 跟踪的配置文件和未信任的 Codex 项目，并提示仓库级 hooksPath', () => {

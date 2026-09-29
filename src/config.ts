@@ -33,13 +33,18 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 
 function readJson(file: string): Partial<AicodeConfig> {
   if (!fs.existsSync(file)) return {};
-  let raw: Record<string, unknown>;
+  let parsed: unknown;
   try {
-    raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
   } catch (err) {
     logError(`config ${file}`, err);
     return {};
   }
+  if (!isPlainObject(parsed)) {
+    logError(`config ${file}`, new Error('顶层不是对象，已忽略该文件'));
+    return {};
+  }
+  const raw = parsed;
   const out: Partial<AicodeConfig> = {};
   if (raw.owner !== undefined) {
     if (raw.owner && typeof raw.owner === 'object' && !Array.isArray(raw.owner)) out.owner = raw.owner as AicodeConfig['owner'];
@@ -104,6 +109,11 @@ function parseGlobalConfigStrict(file: string): Record<string, unknown> {
   }
   if (!isPlainObject(raw)) throw new Error(`全局配置 ${file} 解析失败，请先修复后再试`);
   return raw;
+}
+
+/** 仅校验全局配置可被安全解析，不做任何写入；供 init --local 等场景提前失败，避免走到一半才因配置损坏中止 */
+export function assertGlobalConfigWritable(): void {
+  parseGlobalConfigStrict(configPath());
 }
 
 /**
