@@ -12,7 +12,15 @@ export const HOOK_NAMES = [
   'pre-auto-gc', 'push-to-checkout', 'sendemail-validate', 'reference-transaction',
 ];
 const PROJECT_MARK = '# aicode project post-commit';
-const backgroundCommit = (commitCommand: string): string => `( ${commitCommand} </dev/null >/dev/null 2>&1 & )`;
+// 同步捕获本次 commit 的信息，避免后台统计进程读到晚到的 HEAD/分支（见 F1）
+const CAPTURE_LINES = [
+  'SHA=$(git rev-parse HEAD 2>/dev/null)',
+  'BRANCH=$(git symbolic-ref -q --short HEAD 2>/dev/null || echo HEAD)',
+  'REFLOG=$(git reflog -1 --format=%gs 2>/dev/null)',
+  'PREV=$(git rev-parse -q --verify HEAD@{1} 2>/dev/null)',
+];
+const backgroundCommit = (commitCommand: string): string =>
+  [...CAPTURE_LINES, `( ${commitCommand} --sha "$SHA" --branch "$BRANCH" --reflog "$REFLOG" --prev "$PREV" </dev/null >/dev/null 2>&1 & )`].join('\n');
 
 // ---------- 全局模式 ----------
 

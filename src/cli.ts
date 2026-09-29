@@ -12,6 +12,16 @@ const USAGE = [
   '  aicode commit                                   由 post-commit 调用',
 ].join('\n');
 
+/** 解析 `--name value` 形式的参数；未传或值为空字符串时视为缺省 */
+function parseFlags(args: string[], names: string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const name of names) {
+    const i = args.indexOf(`--${name}`);
+    if (i !== -1 && args[i + 1] !== undefined && args[i + 1] !== '') out[name] = args[i + 1];
+  }
+  return out;
+}
+
 async function readStdin(): Promise<string> {
   if (process.stdin.isTTY) return '';
   const chunks: Buffer[] = [];
@@ -69,7 +79,8 @@ async function main(args: string[]): Promise<number> {
       return 0;
     }
     if (cmd === 'commit') {
-      await runCommit(process.cwd());
+      const opts = parseFlags(rest, ['sha', 'branch', 'reflog', 'prev']);
+      await runCommit(process.cwd(), opts);
       return 0;
     }
   } catch (err) {

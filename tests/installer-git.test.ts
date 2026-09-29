@@ -55,9 +55,11 @@ describe('exclude', () => {
 });
 
 describe('全局模式', () => {
-  it('只有 post-commit 会额外在后台启动统计', () => {
-    expect(renderForwarder('post-commit', null, "'node' 'cli' commit")).toContain("( 'node' 'cli' commit </dev/null >/dev/null 2>&1 & )");
-    expect(renderForwarder('pre-commit', null, "'node' 'cli' commit")).not.toContain('commit </dev/null');
+  it('只有 post-commit 会额外在后台启动统计，且同步捕获本次 commit 的信息', () => {
+    const post = renderForwarder('post-commit', null, "'node' 'cli' commit");
+    expect(post).toContain('SHA=$(git rev-parse HEAD 2>/dev/null)');
+    expect(post).toContain("( 'node' 'cli' commit --sha \"$SHA\" --branch \"$BRANCH\" --reflog \"$REFLOG\" --prev \"$PREV\" </dev/null >/dev/null 2>&1 & )");
+    expect(renderForwarder('pre-commit', null, "'node' 'cli' commit")).not.toContain('commit --sha');
   });
 
   it('设置全局 hooksPath，转发到仓库自有 hook 并保留其退出码', () => {

@@ -10,22 +10,25 @@ import { VERSION } from './version.js';
 
 export const LEDGER_TTL_SECONDS = 7 * 86400;
 
-export async function runCommit(cwd: string): Promise<CommitEvent | null> {
+export interface RunCommitOptions { sha?: string; branch?: string; reflog?: string; prev?: string }
+
+export async function runCommit(cwd: string, opts?: RunCommitOptions): Promise<CommitEvent | null> {
   const root = repoRoot(cwd);
   if (!root) return null;
-  const info = commitInfo(root, 'HEAD');
+  const info = commitInfo(root, opts?.sha ?? 'HEAD');
   if (info.parents.length > 1) return null; // merge commit 不统计
   const id = repoId(root);
   const eventId = `${id}:${info.sha}`;
 
   const config = loadConfig(root);
-  const branch = currentBranch(root);
+  const branch = opts?.branch ?? currentBranch(root);
   const isIgnored = buildIgnore(root, config.ignore);
   const moduleOf = createModuleResolver(config.modules, branch);
   const diffs = commitDiff(root, info.sha);
   const key = repoKey(id);
 
-  const amend = isAmend(root);
+  // hook 同步捕获的 reflog 优先于事后重新读取，避免读到晚到的状态（见 F1）
+  const amend = opts?.reflog !== undefined ? opts.reflog.startsWith('commit (amend)') : isAmend(root);
   const owner = resolveOwner(config, { name: info.authorName, email: info.authorEmail });
 
   const event = withLock(key, (): CommitEvent | null => {

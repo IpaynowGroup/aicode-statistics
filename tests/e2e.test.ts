@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { commitAll, initRepo, tmpHome } from './helpers.js';
+import { commitAll, initRepo, sh, tmpHome } from './helpers.js';
 
 const CLI = path.resolve('dist/cli.js');
 let home: string;
@@ -98,6 +98,32 @@ describe('端到端', () => {
   it('hook 输入损坏时退出码仍为 0，并写入日志', () => {
     expect(run(['hook', 'pre', '--tool', 'claude'], '{bad').status).toBe(0);
     expect(fs.readFileSync(path.join(home, '.aicode', 'logs', 'aicode.log'), 'utf8')).toContain('[hook]');
+  });
+
+  it('post-commit 同步捕获本次 commit 的 sha/分支，连续提交或提交后立即切换分支都不出错', async () => {
+    expect(run(['init', '--yes']).status).toBe(0);
+    const repo = initRepo();
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+    commitAll(repo, 'init');
+
+    // 一行 shell 内连续两次 commit：旧实现在后台读 HEAD 会把 c1 丢掉
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'b\n');
+    sh(repo, ['add', '-A']);
+    execFileSync('sh', ['-c', 'git commit -q -m c1 && echo c >> a.txt && git add -A && git commit -q -m c2'], { cwd: repo });
+    const sha1 = execFileSync('git', ['rev-parse', 'HEAD~1'], { cwd: repo, encoding: 'utf8' }).trim();
+    const sha2 = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    const e1 = await waitForEvent(sha1);
+    const e2 = await waitForEvent(sha2);
+    expect(e1.commit_sha).toBe(sha1);
+    expect(e2.commit_sha).toBe(sha2);
+
+    // commit 后立即切换分支：事件应记录提交时所在的分支，而不是切换后的分支
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'd\n');
+    sh(repo, ['add', '-A']);
+    execFileSync('sh', ['-c', 'git commit -q -m c3 && git checkout -q -b other'], { cwd: repo });
+    const sha3 = execFileSync('git', ['rev-parse', 'other'], { cwd: repo, encoding: 'utf8' }).trim();
+    const e3 = await waitForEvent(sha3);
+    expect(e3.branch).toBe('master');
   });
 
   it('init --uninstall --yes 移除全部钩子', () => {
