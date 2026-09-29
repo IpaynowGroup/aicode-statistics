@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import readline from 'node:readline';
 import { runCommit } from './commit.js';
-import { loadConfig } from './config.js';
+import { globalConfigParseError, loadConfig } from './config.js';
 import { createTtyPrompter, defaultProbe, disableMysql, runMysqlWizard } from './configure.js';
 import { countUnreported } from './events.js';
 import { repoRoot } from './git.js';
@@ -86,6 +86,11 @@ function track(flags: string[]): number {
       return 1;
     }
   }
+  if (flags.includes('--all') && flags.includes('--list')) {
+    console.error('--all 和 --list 不能同时使用');
+    console.error(USAGE);
+    return 1;
+  }
   if (flags.includes('--list')) {
     console.log(describeTrack());
     return 0;
@@ -122,7 +127,17 @@ function untrack(flags: string[]): number {
   return 0;
 }
 
-async function sync(): Promise<number> {
+async function sync(args: string[]): Promise<number> {
+  if (args.length) {
+    console.error(`未知参数: ${args[0]}`);
+    console.error(USAGE);
+    return 1;
+  }
+  const parseError = globalConfigParseError();
+  if (parseError) {
+    console.error(parseError);
+    return 1;
+  }
   const config = loadConfig(null);
   const reporter = await loadReporter(config.reporter);
   if (reporter.name === 'noop') {
@@ -144,15 +159,29 @@ async function sync(): Promise<number> {
   return 0;
 }
 
-function status(): number {
+function status(args: string[]): number {
+  if (args.length) {
+    console.error(`未知参数: ${args[0]}`);
+    console.error(USAGE);
+    return 1;
+  }
+  const parseError = globalConfigParseError();
+  if (parseError) {
+    console.log(parseError);
+    return 0;
+  }
   console.log(describeStatus(loadConfig(null)));
   return 0;
 }
 
 async function config(args: string[]): Promise<number> {
   const [sub, ...flags] = args;
+  if (sub === undefined) {
+    console.error('缺少子命令，用法：aicode config mysql [--disable]');
+    return 1;
+  }
   if (sub !== 'mysql') {
-    console.error(`未知参数: ${sub ?? ''}`);
+    console.error(`未知参数: ${sub}`);
     console.error(USAGE);
     return 1;
   }
@@ -209,7 +238,7 @@ async function main(args: string[]): Promise<number> {
   }
   if (cmd === 'sync') {
     try {
-      return await sync();
+      return await sync(rest);
     } catch (err) {
       console.error(`aicode sync 失败: ${err instanceof Error ? err.message : String(err)}`);
       return 1;
@@ -217,7 +246,7 @@ async function main(args: string[]): Promise<number> {
   }
   if (cmd === 'status') {
     try {
-      return status();
+      return status(rest);
     } catch (err) {
       console.error(`aicode status 失败: ${err instanceof Error ? err.message : String(err)}`);
       return 1;

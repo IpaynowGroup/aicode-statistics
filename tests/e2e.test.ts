@@ -230,4 +230,53 @@ describe('端到端', () => {
     const listAfter = run(['track', '--list'], undefined, repo);
     expect(listAfter.stdout).not.toContain('gitlab.example.com/group/proj');
   });
+
+  it('全局配置损坏时，status 提示解析失败且退出 0；sync 提示解析失败且退出 1、不尝试补发', () => {
+    expect(run(['init', '--yes']).status).toBe(0);
+    const configFile = path.join(home, '.aicode', 'config.json');
+    fs.writeFileSync(configFile, '{bad json');
+
+    const s = run(['status']);
+    expect(s.status).toBe(0);
+    expect(s.stdout).toContain(`全局配置 ${configFile} 解析失败，请先修复`);
+
+    const r = run(['sync']);
+    expect(r.status).toBe(1);
+    expect(r.stdout + r.stderr).toContain(`全局配置 ${configFile} 解析失败，请先修复`);
+  });
+
+  it('全局配置 track 字段无效时，status 提示已按统计全部仓库处理', () => {
+    expect(run(['init', '--yes']).status).toBe(0);
+    const configFile = path.join(home, '.aicode', 'config.json');
+    const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    config.track = { mode: 'bogus' };
+    fs.writeFileSync(configFile, JSON.stringify(config));
+
+    const r = run(['status']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('track 字段无效，已按统计全部仓库处理');
+  });
+
+  it('sync / status 拒绝多余参数', () => {
+    expect(run(['init', '--yes']).status).toBe(0);
+    const s = run(['sync', 'extra']);
+    expect(s.status).toBe(1);
+    expect(s.stderr).toContain('未知参数');
+
+    const st = run(['status', 'extra']);
+    expect(st.status).toBe(1);
+    expect(st.stderr).toContain('未知参数');
+  });
+
+  it('aicode config 缺少子命令时给出专门提示', () => {
+    const r = run(['config']);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('缺少子命令，用法：aicode config mysql [--disable]');
+  });
+
+  it('aicode track --all --list 同时出现时报错退出 1', () => {
+    const r = run(['track', '--all', '--list']);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('不能同时使用');
+  });
 });

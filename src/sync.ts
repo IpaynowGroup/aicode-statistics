@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { AicodeConfig, ReporterConfig } from './config.js';
+import { isTrackConfig, readGlobalConfig, type AicodeConfig, type ReporterConfig } from './config.js';
 import { countUnreported } from './events.js';
 import { syncStatePath } from './paths.js';
 import { flushEvents, type Reporter } from './reporter/index.js';
@@ -127,13 +127,17 @@ function describeReporter(reporter: ReporterConfig): string {
 
 export function describeStatus(config: AicodeConfig): string {
   const state = readSyncState();
-  const lines = [
+  const lines: string[] = [];
+  // track 字段类型错误时 loadConfig/getTrack 已按默认值（全部仓库）兜底，这里额外提示用户配置有问题
+  const rawTrack = readGlobalConfig().track;
+  if (rawTrack !== undefined && !isTrackConfig(rawTrack)) lines.push('track 字段无效，已按统计全部仓库处理');
+  lines.push(
     describeTrack(),
     describeReporter(config.reporter),
     `本地积压事件：${countUnreported()} 条`,
     `最近尝试时间：${state.lastAttemptAt ?? '(无)'}`,
     `最近成功时间：${state.lastSuccessAt ?? '(无)'}`,
-  ];
+  );
   if (state.consecutiveFailures > 0) lines.push(`最近错误：${state.lastError ?? '(未知错误)'}`);
   lines.push(`下次自动补发时间：${state.nextRetryAt ?? '(无退避，随时可补发)'}`);
   return lines.join('\n');

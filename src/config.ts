@@ -117,6 +117,19 @@ export function assertGlobalConfigWritable(): void {
 }
 
 /**
+ * 供 `aicode status` / `aicode sync` 使用：全局配置文件存在但解析失败（损坏的 JSON 或顶层不是对象）时，
+ * 返回中文提示；文件不存在或能正常解析时返回 null（此时不代表"未配置"，调用方仍需按各自逻辑处理）。
+ */
+export function globalConfigParseError(): string | null {
+  try {
+    assertGlobalConfigWritable();
+    return null;
+  } catch {
+    return `全局配置 ${configPath()} 解析失败，请先修复`;
+  }
+}
+
+/**
  * 读→改→写全局配置，保留未知字段；确保 ~/.aicode 目录权限 700、配置文件权限 600。
  * 若现有文件损坏或不是普通对象，直接抛错并放弃写入（不调用 mutate），避免静默覆盖用户配置（如 reporter 密码）。
  * 写入采用临时文件 + rename 的方式保证原子性。

@@ -62,8 +62,8 @@ export async function flushEvents(reporter: Reporter, limit = 50): Promise<Flush
   try {
     for (const event of readUnreported(limit)) {
       if (typeof event.event_id !== 'string' || !event.event_id) {
-        // 事件缺少合法 event_id：既无法上报也无法标记已上报，跳过它，避免污染真实事件的顺序，
-        // 也避免它被无限重试（配合 syncAll 的批次首元素重复检测，见控制器裁定）
+        // 事件缺少合法 event_id：既无法上报也无法标记已上报，跳过它（不计入 sent），
+        // 避免污染真实事件的顺序，也避免它被无限重试
         logError(`report ${reporter.name}`, new Error('事件缺少合法 event_id，已跳过'));
         continue;
       }
