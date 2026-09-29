@@ -390,6 +390,6 @@ sql/schema.sql           # MySQL 5.6+ 建表脚本
   - 同步状态存于 `~/.aicode/sync-state.json`：`{ lastAttemptAt, lastSuccessAt, lastError, consecutiveFailures, nextRetryAt }`
   - 失败后 `consecutiveFailures += 1`，`nextRetryAt = now + min(2^(consecutiveFailures-1) 分钟, 30 分钟)`；成功后清零
   - 自动补发仅在 `now >= nextRetryAt` 时进行；手动 `aicode sync` 同样更新该状态
-  - `reporter.type = "noop"` 时视为总是成功
+  - `reporter.type = "noop"` 时不消费队列：事件保留在本地、不标记已上报，配置 MySQL 后执行 `aicode sync` 可补发全部历史事件（修订第 8 节中 noop "直接返回、按已上报处理"的旧约定）
 - `aicode status`：打印统计模式与名单、reporter 类型（mysql 时显示 host/database/user，不显示密码）、队列积压条数、最近一次同步时间与结果、下一次允许自动补发的时间
 - 不做定时同步
