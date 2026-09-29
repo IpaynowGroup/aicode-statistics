@@ -22,8 +22,9 @@ const CAPTURE_LINES = [
   'REFLOG=$(git reflog -1 --format=%gs 2>/dev/null)',
   'PREV=$(git rev-parse -q --verify HEAD@{1} 2>/dev/null)',
 ];
-const backgroundCommit = (commitCommand: string): string =>
-  [...CAPTURE_LINES, `( ${commitCommand} --sha "$SHA" --branch "$BRANCH" --reflog "$REFLOG" --prev "$PREV" </dev/null >/dev/null 2>&1 & )`].join('\n');
+// 只负责用已捕获好的变量在后台启动统计，调用方需保证 CAPTURE_LINES 已在调用原 hook 之前执行过
+const launchBackgroundCommit = (commitCommand: string): string =>
+  `( ${commitCommand} --sha "$SHA" --branch "$BRANCH" --reflog "$REFLOG" --prev "$PREV" </dev/null >/dev/null 2>&1 & )`;
 
 // ---------- 全局模式 ----------
 
@@ -62,10 +63,11 @@ export function renderForwarder(name: string, prevHooksPath: string | null, comm
     `HOOK_NAME=${shq(name)}`,
     `PREV_HOOKS=${shq(prevHooksPath ?? '')}`,
     'if [ -n "$PREV_HOOKS" ]; then TARGET="$PREV_HOOKS/$HOOK_NAME"; else TARGET="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/$HOOK_NAME"; fi',
-    'status=0',
-    'if [ -x "$TARGET" ]; then "$TARGET" "$@"; status=$?; fi',
   ];
-  if (name === 'post-commit') lines.push(backgroundCommit(commitCommand));
+  // 在调用原 hook 之前捕获本次 commit 的身份，避免原 hook 自己又产生新提交或切换分支后读错（见 R2）
+  if (name === 'post-commit') lines.push(...CAPTURE_LINES);
+  lines.push('status=0', 'if [ -x "$TARGET" ]; then "$TARGET" "$@"; status=$?; fi');
+  if (name === 'post-commit') lines.push(launchBackgroundCommit(commitCommand));
   lines.push('exit $status');
   return lines.join('\n') + '\n';
 }
@@ -107,9 +109,11 @@ export function renderProjectPostCommit(origPath: string, commitCommand: string)
     '#!/bin/sh',
     PROJECT_MARK,
     `ORIG=${shq(origPath)}`,
+    // 在调用原 hook 之前捕获本次 commit 的身份，避免原 hook 自己又产生新提交或切换分支后读错（见 R2）
+    ...CAPTURE_LINES,
     'status=0',
     'if [ -x "$ORIG" ]; then "$ORIG" "$@"; status=$?; fi',
-    backgroundCommit(commitCommand),
+    launchBackgroundCommit(commitCommand),
     'exit $status',
   ].join('\n') + '\n';
 }
