@@ -20,6 +20,21 @@ function checkDeadline(deadline: number): void {
   if (Date.now() > deadline) throw new BudgetExceeded('钩子超出时间预算');
 }
 
+/** 供传给 git()/statusPaths() 等的 timeoutMs：始终 >=1，deadline 已过时也不会传 0/负数 */
+function remainingMs(deadline: number): number {
+  return Math.max(1, deadline - Date.now());
+}
+
+/** git 子进程被 execFileSync 的 timeout 杀掉时会抛 ETIMEDOUT；统一转成 BudgetExceeded，绝不让钩子卡死 */
+function runWithDeadline<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ETIMEDOUT') throw new BudgetExceeded('钩子超出时间预算');
+    throw err;
+  }
+}
+
 /** 文件不存在返回 []；过大、二进制或不可读返回 null */
 export function readFingerprints(absPath: string): string[] | null {
   let buf: Buffer;
@@ -56,7 +71,7 @@ export function editChanges(b: EditBaseline): Change[] {
 }
 
 export function captureShellBaseline(repoRoot: string, isIgnored: IgnoreFn, deadline: number): ShellBaseline | null {
-  const paths = statusPaths(repoRoot);
+  const paths = runWithDeadline(() => statusPaths(repoRoot, remainingMs(deadline)));
   if (paths.length > MAX_STATUS_FILES) return null;
   const files: Record<string, FileState> = {};
   for (const rel of paths) {
@@ -71,7 +86,7 @@ export function captureShellBaseline(repoRoot: string, isIgnored: IgnoreFn, dead
 }
 
 export function shellChanges(b: ShellBaseline, isIgnored: IgnoreFn, deadline: number): Change[] {
-  const paths = statusPaths(b.repoRoot);
+  const paths = runWithDeadline(() => statusPaths(b.repoRoot, remainingMs(deadline)));
   if (paths.length > MAX_STATUS_FILES) return [];
   const changes: Change[] = [];
   for (const rel of paths) {
@@ -85,7 +100,7 @@ export function shellChanges(b: ShellBaseline, isIgnored: IgnoreFn, deadline: nu
     const after = readFingerprints(abs);
     if (!after) continue;
     // pre 时已改动的文件用 pre 的指纹；否则以 HEAD 版本为基线（新文件为空）
-    const before = prev ? prev.fps : fingerprintText(showFile(b.repoRoot, 'HEAD', rel) ?? '');
+    const before = prev ? prev.fps : fingerprintText(showFile(b.repoRoot, 'HEAD', rel, remainingMs(deadline)) ?? '');
     if (!before) continue;
     const fps = multisetDiff(after, before);
     if (fps.length) changes.push({ repoRoot: b.repoRoot, rel, fps });

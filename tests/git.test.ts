@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
-  commitDiff, commitInfo, currentBranch, isAmend, normalizeRemote, parseUnifiedDiff, repoId, repoKey,
+  buildStatusArgs, commitDiff, commitInfo, currentBranch, isAmend, normalizeRemote, parseUnifiedDiff, repoId, repoKey,
   repoRoot, repoRootForPath, showFile, statusPaths, toRepoRelative,
 } from '../src/git.js';
 import { commitAll, initRepo, sh } from './helpers.js';
@@ -84,6 +84,12 @@ describe('仓库操作', () => {
     expect(repoRootForPath(abs)).toBe(repo);
     expect(toRepoRelative(repo, abs)).toBe('x/y/z.ts');
     expect(repoRootForPath('/definitely/not/here/a.ts')).toBeNull();
+  });
+
+  it('buildStatusArgs 带 --no-optional-locks，避免与用户操作竞争 .git/index.lock', () => {
+    const args = buildStatusArgs();
+    expect(args[0]).toBe('--no-optional-locks');
+    expect(args).toContain('status');
   });
 
   it('statusPaths 列出改动、未跟踪文件和重命名后的新路径', () => {

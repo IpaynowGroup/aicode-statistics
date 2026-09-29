@@ -69,6 +69,13 @@ describe('shell 类基线', () => {
     fs.writeFileSync(path.join(repo, 'x.ts'), 'x\n');
     expect(() => captureShellBaseline(repo, buildIgnore(repo, []), Date.now() - 1)).toThrow(BudgetExceeded);
   });
+
+  it('即使没有改动文件，deadline 已过期时也会在 statusPaths 阶段抛出（而不仅是逐文件循环里）', () => {
+    const repo = initRepo();
+    fs.writeFileSync(path.join(repo, 'a.ts'), 'a\n');
+    commitAll(repo, 'init'); // 干净仓库，git status 没有任何变化，逐文件循环不会执行
+    expect(() => captureShellBaseline(repo, buildIgnore(repo, []), Date.now() - 1)).toThrow(BudgetExceeded);
+  });
 });
 
 describe('pending', () => {

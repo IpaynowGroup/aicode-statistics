@@ -3,18 +3,20 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 
-export function git(cwd: string, args: string[]): string {
+/** timeoutMs 传入时由 execFileSync 强制超时终止子进程，避免钩子路径被 git 卡死（见 F4） */
+export function git(cwd: string, args: string[], timeoutMs?: number): string {
   return execFileSync('git', args, {
     cwd,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
     maxBuffer: 256 * 1024 * 1024,
+    ...(timeoutMs !== undefined ? { timeout: timeoutMs, killSignal: 'SIGKILL' as const } : {}),
   });
 }
 
-export function tryGit(cwd: string, args: string[]): string | null {
+export function tryGit(cwd: string, args: string[], timeoutMs?: number): string | null {
   try {
-    return git(cwd, args);
+    return git(cwd, args, timeoutMs);
   } catch {
     return null;
   }
@@ -73,9 +75,14 @@ export function currentBranch(root: string): string {
   return tryGit(root, ['rev-parse', '--abbrev-ref', 'HEAD'])?.trim() ?? 'HEAD';
 }
 
+/** git status 参数；--no-optional-locks 避免与用户操作竞争 .git/index.lock（git ≥ 2.15，见 F4） */
+export function buildStatusArgs(): string[] {
+  return ['--no-optional-locks', 'status', '--porcelain=v1', '-z', '--untracked-files=all'];
+}
+
 /** 已改动（含未跟踪）文件的仓库相对路径；重命名只保留新路径 */
-export function statusPaths(root: string): string[] {
-  const out = git(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+export function statusPaths(root: string, timeoutMs?: number): string[] {
+  const out = git(root, buildStatusArgs(), timeoutMs);
   const parts = out.split('\0');
   const paths: string[] = [];
   for (let i = 0; i < parts.length; i++) {
@@ -88,8 +95,8 @@ export function statusPaths(root: string): string[] {
   return paths;
 }
 
-export function showFile(root: string, rev: string, rel: string): string | null {
-  return tryGit(root, ['show', `${rev}:${rel}`]);
+export function showFile(root: string, rev: string, rel: string, timeoutMs?: number): string | null {
+  return tryGit(root, ['show', `${rev}:${rel}`], timeoutMs);
 }
 
 export interface CommitInfo {
