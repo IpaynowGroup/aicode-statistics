@@ -356,3 +356,40 @@ sql/schema.sql           # MySQL 5.6+ 建表脚本
 - MySQL：单元测试注入假连接，校验 SQL、参数、事务和回滚；设置 `AICODE_TEST_MYSQL_URL` 时对真实 MySQL 跑集成测试（验证重复上报幂等）
 - 真机验证：在本机 Claude Code 和 Codex（0.155.1）上各完成一次"AI 修改 → 提交"，核对统计结果
 - 性能：编辑类钩子 < 50ms；shell 类钩子在 1 万个文件的仓库中 < 300ms；包含 1000 行改动的 commit，统计耗时 < 1s
+
+## 13. 补充需求（2026-09-29）
+
+### 13.1 统计名单（全局安装下控制统计范围）
+
+- 全局配置新增 `"track": { "mode": "all" | "list", "repos": ["<repo_id>", ...] }`；缺省为 `{ "mode": "all", "repos": [] }`（即原行为）
+- `mode = "list"` 时，只有 `repo_id` 在 `repos` 中的仓库才会被统计：钩子在 pre 阶段直接跳过（不存基线、不写 ledger），`aicode commit` 直接返回，不生成事件
+- `track` 只从全局配置读取，仓库级 `.aicode.json` 不能修改
+- 命令（在仓库内执行）：
+  - `aicode track`：把当前仓库加入名单，并把 `mode` 设为 `list`（首次切换时提示"现在只统计名单中的仓库"）
+  - `aicode untrack`：把当前仓库移出名单
+  - `aicode track --all`：`mode` 改回 `all`（名单保留）
+  - `aicode track --list`：打印当前模式与名单
+- `aicode init --local` 安装时把当前仓库加入名单（不改变 `mode`），`--local --uninstall` 时移出
+- 写入全局配置时保留其中的未知字段，文件权限保持 600
+
+### 13.2 MySQL 配置向导
+
+- `aicode config mysql`：交互式依次询问 host、port（默认 3306）、database、user、password（输入不回显）；已有配置时以现值作为默认值，直接回车沿用（密码回车表示沿用原密码）
+- 保存前测试：连接超时 5 秒；执行 `SELECT 1`；执行 `SHOW GRANTS FOR CURRENT_USER()`，确认对该库（`db.*`、`db.ai_commit` 等三张表，或 `*.*` / `ALL PRIVILEGES`）具有 INSERT 权限
+- 测试失败时显示原因并询问"仍然保存？[y/N]"
+- 保存到全局配置 `reporter = { type: "mysql", options: { host, port, user, password, database } }`，文件权限 600
+- `aicode config mysql --disable`：把 `reporter` 改为 `{ type: "noop" }`
+- 必须在交互终端中运行；非交互环境直接报错退出（退出码 1）
+- 输出与日志中不得出现密码
+
+### 13.3 同步与状态
+
+- 本地队列即 `events.jsonl` + `events.reported.jsonl`（第 8 节），不变
+- `aicode sync`：循环分批（每批 50 条）上报全部未上报事件，直到队列为空或遇到失败；忽略退避，总是立即尝试；打印成功条数、剩余条数与失败原因；退出码：全部成功 0，否则 1
+- 提交时的自动补发（`aicode commit` 末尾）改为受退避控制：
+  - 同步状态存于 `~/.aicode/sync-state.json`：`{ lastAttemptAt, lastSuccessAt, lastError, consecutiveFailures, nextRetryAt }`
+  - 失败后 `consecutiveFailures += 1`，`nextRetryAt = now + min(2^(consecutiveFailures-1) 分钟, 30 分钟)`；成功后清零
+  - 自动补发仅在 `now >= nextRetryAt` 时进行；手动 `aicode sync` 同样更新该状态
+  - `reporter.type = "noop"` 时视为总是成功
+- `aicode status`：打印统计模式与名单、reporter 类型（mysql 时显示 host/database/user，不显示密码）、队列积压条数、最近一次同步时间与结果、下一次允许自动补发的时间
+- 不做定时同步
