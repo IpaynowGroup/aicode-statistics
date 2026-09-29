@@ -119,6 +119,20 @@ describe('planProject', () => {
     expect(fs.existsSync(hookFile + '.aicode-orig')).toBe(true);
   });
 
+  it('安装前检测到 post-commit 冲突（已被其他工具替换且存在旧备份）时立即报错，不写入任何文件（见 R4）', () => {
+    const repo = initRepo();
+    const hookFile = path.join(repo, '.git', 'hooks', 'post-commit');
+    fs.writeFileSync(hookFile, '#!/bin/sh\necho mine\n', { mode: 0o755 });
+    fs.writeFileSync(hookFile + '.aicode-orig', '#!/bin/sh\necho stale-backup\n', { mode: 0o755 });
+
+    expect(() => planProject(repo, false)).toThrow(/post-commit 已被其他工具替换/);
+    // 报错前不能写入任何文件：既不能碰 ~/.aicode，也不能碰仓库里的其他配置
+    expect(fs.existsSync(path.join(home, '.aicode'))).toBe(false);
+    expect(fs.existsSync(path.join(repo, '.claude'))).toBe(false);
+    expect(fs.readFileSync(hookFile, 'utf8')).toContain('echo mine');
+    expect(fs.readFileSync(hookFile + '.aicode-orig', 'utf8')).toContain('echo stale-backup');
+  });
+
   it('跳过已被 git 跟踪的配置文件和未信任的 Codex 项目，并提示仓库级 hooksPath', () => {
     const repo = initRepo();
     fs.mkdirSync(path.join(repo, '.claude'));

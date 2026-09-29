@@ -6,7 +6,8 @@ import { installClaude, uninstallClaude } from './installer/claude.js';
 import { installCodex, installProjectCodex, isCodexTrusted, uninstallCodex, uninstallProjectCodex } from './installer/codex.js';
 import { addExclude, removeExclude } from './installer/exclude.js';
 import {
-  installGitHooks, installProjectGitHook, isAicodeHook, projectHookPath, uninstallGitHooks, uninstallProjectGitHook,
+  hasForeignPostCommitConflict, installGitHooks, installProjectGitHook, isAicodeHook, projectHookPath, uninstallGitHooks,
+  uninstallProjectGitHook,
 } from './installer/git.js';
 import { aicodeHome, claudeSettingsPath, codexHome, configPath, ledgerDir, logPath, pendingDir } from './paths.js';
 
@@ -90,6 +91,11 @@ export function planProject(cwd: string, uninstall: boolean): Plan {
     }
     steps.push({ file: hookFile, summary: '删除 aicode 的 post-commit，恢复原有 hook', apply: () => uninstallProjectGitHook(root) });
     return { steps, notes };
+  }
+
+  // 提前检测 post-commit 冲突：已被其他工具替换且存在旧备份时中止，不写入任何文件（见 R4）
+  if (hasForeignPostCommitConflict(root)) {
+    throw new Error('post-commit 已被其他工具替换，且存在旧的 post-commit.aicode-orig，请先手动处理');
   }
 
   steps.push(homeStep());

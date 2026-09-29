@@ -126,15 +126,20 @@ export function isAicodeHook(file: string): boolean {
   }
 }
 
+/** hook 已被其他工具替换，且已有一份旧备份：直接覆盖会连同对方的 hook 一起丢失，需要中止让用户手动处理（见 R4） */
+export function hasForeignPostCommitConflict(repo: string): boolean {
+  const hook = projectHookPath(repo);
+  return fs.existsSync(hook) && !isAicodeHook(hook) && fs.existsSync(hook + '.aicode-orig');
+}
+
 export function installProjectGitHook(repo: string): void {
   const hook = projectHookPath(repo);
   const orig = hook + '.aicode-orig';
   fs.mkdirSync(path.dirname(hook), { recursive: true });
+  if (hasForeignPostCommitConflict(repo)) {
+    throw new Error('post-commit 已被其他工具替换，且存在旧的 post-commit.aicode-orig，请先手动处理');
+  }
   if (fs.existsSync(hook) && !isAicodeHook(hook)) {
-    if (fs.existsSync(orig)) {
-      // hook 已被其他工具替换，且已有一份旧备份：直接覆盖会连同对方的 hook 一起丢失，改为中止让用户手动处理
-      throw new Error('post-commit 已被其他工具替换，且存在旧的 post-commit.aicode-orig，请先手动处理');
-    }
     fs.renameSync(hook, orig);
   }
   fs.writeFileSync(hook, renderProjectPostCommit(orig, aicodeCommand('commit')));
