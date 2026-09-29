@@ -199,9 +199,15 @@ describe('readSyncState 对非法字段做类型兜底（见控制器裁定）',
     expect(() => backoffMs(state.consecutiveFailures + 1)).not.toThrow();
     expect(backoffMs(state.consecutiveFailures + 1)).toBe(60_000);
   });
+
+  it('consecutiveFailures 为负数时按 0 处理（Math.max(0, ...) 兜底）', () => {
+    fs.mkdirSync(path.dirname(syncStatePath()), { recursive: true });
+    fs.writeFileSync(syncStatePath(), JSON.stringify({ consecutiveFailures: -3 }));
+    expect(readSyncState().consecutiveFailures).toBe(0);
+  });
 });
 
-describe('syncAll 的批次首元素重复检测（见控制器裁定）', () => {
+describe('syncAll 对缺合法 event_id 的脏事件：跳过但不提前终止整个同步（见控制器裁定，去掉多余的批次首元素重复守卫）', () => {
   it('事件缺少合法 event_id 时被跳过、不标记已上报；即便它永远排在队首，syncAll 仍能正常终止（不死循环）', async () => {
     // 直接往 events.jsonl 写一条缺 event_id 的脏数据，混在正常事件之间
     fs.mkdirSync(path.dirname(eventsPath()), { recursive: true });
@@ -229,5 +235,19 @@ describe('syncAll 的批次首元素重复检测（见控制器裁定）', () =>
     expect(result.sent).toBe(0);
     expect(result.failed).toBe(false);
     expect(countUnreported()).toBe(2);
+  });
+
+  it('1 条脏数据排在队首 + 120 条正常事件：syncAll 发送全部 120 条而不是提前中止（回归：曾经的批次首元素重复守卫会在此场景提前打断，见控制器裁定）', async () => {
+    fs.mkdirSync(path.dirname(eventsPath()), { recursive: true });
+    fs.appendFileSync(eventsPath(), JSON.stringify({ repo: 'r', commit_sha: 'bad' }) + '\n'); // 排在最前面、永远无法被标记已上报
+    for (let i = 0; i < 120; i++) appendEvent(ev(`e${i}`));
+
+    const { reporter, calls } = makeCountingReporter('lenient');
+    const result = await syncAll(reporter);
+
+    expect(calls).toHaveLength(120);
+    expect(result.sent).toBe(120);
+    expect(result.failed).toBe(false);
+    expect(countUnreported()).toBe(1); // 只剩那条脏数据
   });
 });

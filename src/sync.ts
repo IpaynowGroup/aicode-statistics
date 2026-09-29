@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { AicodeConfig, ReporterConfig } from './config.js';
-import { countUnreported, readUnreported } from './events.js';
+import { countUnreported } from './events.js';
 import { syncStatePath } from './paths.js';
 import { flushEvents, type Reporter } from './reporter/index.js';
 import { describeTrack } from './track.js';
@@ -26,7 +26,7 @@ function isValidIsoDate(v: unknown): v is string {
 function sanitizeState(raw: Record<string, unknown>): SyncState {
   const state: SyncState = {
     consecutiveFailures: typeof raw.consecutiveFailures === 'number' && Number.isFinite(raw.consecutiveFailures)
-      ? raw.consecutiveFailures : 0,
+      ? Math.max(0, Math.floor(raw.consecutiveFailures)) : 0,
   };
   if (isValidIsoDate(raw.lastAttemptAt)) state.lastAttemptAt = raw.lastAttemptAt;
   if (isValidIsoDate(raw.lastSuccessAt)) state.lastSuccessAt = raw.lastSuccessAt;
@@ -77,29 +77,19 @@ function recordFailure(now: () => number, error: string | undefined): void {
   });
 }
 
-/** 尚未定义时的哨兵：区分"还没有上一批"与"上一批首元素恰好是 undefined（缺 event_id 的脏数据）" */
-const NO_PREV_BATCH = Symbol('no-prev-batch');
-
-function readFirstUnreportedId(): unknown {
-  return readUnreported(1)[0]?.event_id;
-}
-
-/** 反复补发直到队列清空或失败；reporter 为 noop 时不消费队列（控制器裁定，未配置上报期间事件全部保留在本地） */
+/**
+ * 反复补发直到队列清空或失败；reporter 为 noop 时不消费队列（控制器裁定，未配置上报期间事件全部保留在本地）。
+ * flushEvents 会跳过缺合法 event_id 的脏事件（既不上报也不标记），所以只要队列里还有能被处理的事件，
+ * 每批 sent 必然 > 0；一旦某批 sent === 0 且未失败，说明剩下的（如果有）全是无法处理的脏数据，循环自然结束，
+ * 不需要额外的"批次首元素重复"守卫（曾经加过，会在脏数据排在队首、后面还有大量正常事件时把同步提前打断）。
+ */
 export async function syncAll(
   reporter: Reporter,
   now: () => number = Date.now,
 ): Promise<{ sent: number; remaining: number; failed: boolean; error?: string }> {
   if (reporter.name === 'noop') return { sent: 0, remaining: countUnreported(), failed: false };
   let sent = 0;
-  let prevFirstId: unknown = NO_PREV_BATCH;
   for (;;) {
-    const first = readFirstUnreportedId();
-    if (prevFirstId !== NO_PREV_BATCH && first === prevFirstId) {
-      // 连续两批的队首都是同一条（通常是缺合法 event_id、永远无法被标记已上报的脏数据），
-      // 不会再有进展，停止循环，避免死循环（控制器裁定）
-      break;
-    }
-    prevFirstId = first;
     const result = await flushEvents(reporter, 50);
     sent += result.sent;
     if (result.failed) {
