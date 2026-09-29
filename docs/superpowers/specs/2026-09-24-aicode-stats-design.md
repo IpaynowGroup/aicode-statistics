@@ -262,7 +262,7 @@ export interface Reporter {
 
 支持两种安装模式，统计数据都写入 `~/.aicode/`，统一汇总。
 
-| | 全局模式 `aicode init` | 项目模式 `aicode init --project`（在仓库内执行） |
+| | 全局模式 `aicode init` | 项目模式 `aicode init --local`（在仓库内执行） |
 |---|---|---|
 | 覆盖范围 | 本机所有仓库 | 当前仓库 |
 | Claude Code | `~/.claude/settings.json` | `<仓库>/.claude/settings.local.json` |
@@ -273,7 +273,7 @@ export interface Reporter {
 
 1. **写入前确认**：先列出将要改动的每个文件及改动摘要，用户输入 `y` 才写入。`--yes` 可跳过确认；非交互环境（stdin 不是 TTY）下没有 `--yes` 时，直接中止并提示
 2. **先备份**：已存在的文件在首次修改前备份为 `<文件>.aicode.bak`
-3. **可逆**：`aicode init --uninstall`（全局）和 `aicode init --project --uninstall`（项目）只移除 aicode 写入的内容，其余内容原样保留
+3. **可逆**：`aicode init --uninstall`（全局）和 `aicode init --local --uninstall`（项目）只移除 aicode 写入的内容，其余内容原样保留
 4. 创建 `~/.aicode/` 目录结构和默认 `config.json`（两种模式都会做）
 5. 所有钩子命令都使用 node 和 CLI 的绝对路径，避免钩子运行环境中 PATH 找不到 node（如使用 nvm）
 

@@ -12,8 +12,8 @@ aicode init
 aicode init --uninstall
 
 # 项目模式：只作用于当前仓库（改动 .claude/settings.local.json、.codex/config.toml、.git/hooks/post-commit）
-cd your-repo && aicode init --project
-aicode init --project --uninstall
+cd your-repo && aicode init --local
+aicode init --local --uninstall
 ```
 
 `init` 会先列出将要改动的文件并请求确认，加 `--yes` 可跳过确认。已存在的文件会先备份为 `*.aicode.bak`。项目模式写入的配置文件会加入 `.git/info/exclude`，不会出现在 `git status` 中；如果这些文件已被仓库跟踪，则不会修改。两种模式可以同时安装，不会重复计数。

@@ -7,7 +7,7 @@ import { logError } from './log.js';
 
 const USAGE = [
   '用法:',
-  '  aicode init [--project] [--uninstall] [--yes]   安装 / 卸载钩子（--project 仅作用于当前仓库）',
+  '  aicode init [--local] [--uninstall] [--yes]     安装 / 卸载钩子（--local 仅作用于当前仓库）',
   '  aicode hook <pre|post> --tool <claude|codex>    由 AI 工具钩子调用',
   '  aicode commit                                   由 post-commit 调用',
 ].join('\n');
@@ -37,8 +37,16 @@ async function confirm(question: string): Promise<boolean> {
 }
 
 async function init(flags: string[]): Promise<number> {
+  const allowedFlags = new Set(['--local', '--uninstall', '--yes']);
+  for (const flag of flags) {
+    if (!allowedFlags.has(flag)) {
+      console.error(`未知参数: ${flag}`);
+      console.error(USAGE);
+      return 1;
+    }
+  }
   const uninstall = flags.includes('--uninstall');
-  const plan = flags.includes('--project') ? planProject(process.cwd(), uninstall) : planGlobal(uninstall);
+  const plan = flags.includes('--local') ? planProject(process.cwd(), uninstall) : planGlobal(uninstall);
   console.log(uninstall ? '将执行以下卸载操作：' : '将执行以下改动：');
   for (const s of plan.steps) console.log(`  - ${s.file}\n      ${s.summary}`);
   for (const n of plan.notes) console.log(`  ! ${n}`);

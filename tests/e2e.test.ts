@@ -70,7 +70,7 @@ describe('端到端', () => {
   it('全局 + 项目模式同时安装时，AI 行和事件都不重复', async () => {
     run(['init', '--yes']);
     const repo = initRepo();
-    expect(run(['init', '--project', '--yes'], undefined, repo).status).toBe(0);
+    expect(run(['init', '--local', '--yes'], undefined, repo).status).toBe(0);
     fs.writeFileSync(path.join(repo, 'README.md'), 'init\n');
     commitAll(repo, 'init');
     // 两套钩子各触发一次：pre、pre、post、post
@@ -92,6 +92,13 @@ describe('端到端', () => {
     const r = run(['init']);
     expect(r.status).toBe(1);
     expect(r.stderr).toContain('--yes');
+    expect(fs.existsSync(path.join(home, '.claude', 'settings.json'))).toBe(false);
+  });
+
+  it('未知参数 --project 被拒绝，退出码为 1，不创建文件', () => {
+    const r = run(['init', '--project', '--yes']);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('未知参数');
     expect(fs.existsSync(path.join(home, '.claude', 'settings.json'))).toBe(false);
   });
 
