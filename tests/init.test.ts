@@ -52,6 +52,34 @@ describe('planProject', () => {
     expect(fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8')).toBe(globalCodex);
   });
 
+  it('已有未跟踪的 settings.local.json 时，安装期间产生的 .aicode.bak 被 exclude 忽略；卸载后不留 .bak（见 F5）', () => {
+    const repo = initRepo();
+    fs.mkdirSync(path.join(repo, '.claude'));
+    fs.writeFileSync(path.join(repo, '.claude', 'settings.local.json'), '{"model":"opus"}\n');
+
+    applyAll(planProject(repo, false));
+    expect(fs.existsSync(path.join(repo, '.claude', 'settings.local.json.aicode.bak'))).toBe(true);
+    expect(sh(repo, ['status', '--porcelain'])).toBe(''); // .bak 已被 exclude，不出现在 git status 中
+
+    applyAll(planProject(repo, true));
+    expect(fs.existsSync(path.join(repo, '.claude', 'settings.local.json.aicode.bak'))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8'))).toEqual({ model: 'opus' });
+  });
+
+  it('卸载时已被 git 跟踪的配置文件保持不变，并给出提示（见 F5）', () => {
+    const repo = initRepo();
+    fs.mkdirSync(path.join(repo, '.claude'));
+    const original = '{"model":"opus"}\n';
+    fs.writeFileSync(path.join(repo, '.claude', 'settings.local.json'), original);
+    commitAll(repo, 'track settings');
+
+    const plan = planProject(repo, true);
+    expect(plan.steps.map((s) => path.relative(repo, s.file))).not.toContain('.claude/settings.local.json');
+    expect(plan.notes.join('\n')).toContain('已被 git 跟踪');
+    applyAll(plan);
+    expect(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8')).toBe(original);
+  });
+
   it('跳过已被 git 跟踪的配置文件和未信任的 Codex 项目，并提示仓库级 hooksPath', () => {
     const repo = initRepo();
     fs.mkdirSync(path.join(repo, '.claude'));

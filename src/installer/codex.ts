@@ -135,15 +135,26 @@ export function installProjectCodex(projectConfigFile: string): void {
 export function uninstallProjectCodex(projectConfigFile: string): void {
   uninstallCodex(projectConfigFile);
   const globalFile = path.join(codexHome(), 'config.toml');
-  if (fs.existsSync(globalFile)) fs.writeFileSync(globalFile, removeCodexTrust(fs.readFileSync(globalFile, 'utf8'), projectConfigFile));
+  if (!fs.existsSync(globalFile)) return;
+  const original = fs.readFileSync(globalFile, 'utf8');
+  const text = removeCodexTrust(original, projectConfigFile);
+  if (text === original) return; // 该项目没有信任记录，不做任何改动（见 F5）
+  fs.writeFileSync(globalFile, text);
+  const bak = globalFile + '.aicode.bak';
+  // 该文件可能还被全局钩子或其他项目的信任记录占用，全部清空后备份才不再需要
+  if (fs.existsSync(bak) && !text.includes(BEGIN) && !/# >>> aicode trust /.test(text)) fs.unlinkSync(bak);
 }
 
 export function uninstallCodex(configFile: string): void {
   if (!fs.existsSync(configFile)) return;
-  const text = removeCodexInstall(fs.readFileSync(configFile, 'utf8'));
+  const original = fs.readFileSync(configFile, 'utf8');
+  const text = removeCodexInstall(original);
+  if (text === original) return; // 从未被 aicode 安装过：不做任何改动，也不创建/触碰备份（见 F5）
+  const bak = configFile + '.aicode.bak';
   // 文件由 aicode 创建（无备份）且已清空时直接删除
-  if (text.trim() === '' && !fs.existsSync(configFile + '.aicode.bak')) fs.unlinkSync(configFile);
+  if (text.trim() === '' && !fs.existsSync(bak)) fs.unlinkSync(configFile);
   else fs.writeFileSync(configFile, text);
+  if (fs.existsSync(bak)) fs.unlinkSync(bak); // 卸载成功，备份不再需要
 }
 
 /** Codex 只为已信任的项目加载项目级 .codex/config.toml */

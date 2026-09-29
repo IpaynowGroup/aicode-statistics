@@ -42,6 +42,26 @@ describe('Claude 安装器', () => {
     uninstallClaude(file);
     expect(fs.existsSync(file)).toBe(false);
   });
+
+  it('从未安装过时卸载不做任何改动，也不创建备份（见 F5）', () => {
+    const file = claudeSettingsPath();
+    const original = JSON.stringify({ model: 'opus', hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }] } });
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, original);
+    uninstallClaude(file);
+    expect(fs.readFileSync(file, 'utf8')).toBe(original);
+    expect(fs.existsSync(file + '.aicode.bak')).toBe(false);
+  });
+
+  it('卸载成功后删除安装时创建的 .aicode.bak', () => {
+    const file = claudeSettingsPath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ model: 'opus' }));
+    installClaude(file);
+    expect(fs.existsSync(file + '.aicode.bak')).toBe(true);
+    uninstallClaude(file);
+    expect(fs.existsSync(file + '.aicode.bak')).toBe(false);
+  });
 });
 
 describe('Codex 安装器', () => {
@@ -143,5 +163,41 @@ describe('Codex 安装器', () => {
     uninstallProjectCodex(projectFile);
     expect(fs.existsSync(projectFile)).toBe(false);
     expect(fs.readFileSync(globalFile, 'utf8')).toBe(globalOriginal);
+  });
+
+  it('从未安装过时卸载不做任何改动，也不创建备份（见 F5）', () => {
+    const file = path.join(home, 'repo', '.codex', 'config.toml');
+    const original = 'model = "x"\n';
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, original);
+    uninstallCodex(file);
+    expect(fs.readFileSync(file, 'utf8')).toBe(original);
+    expect(fs.existsSync(file + '.aicode.bak')).toBe(false);
+  });
+
+  it('卸载成功后删除安装时创建的 .aicode.bak', () => {
+    const file = path.join(home, 'repo', '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'model = "x"\n');
+    installCodex(file);
+    expect(fs.existsSync(file + '.aicode.bak')).toBe(true);
+    uninstallCodex(file);
+    expect(fs.existsSync(file + '.aicode.bak')).toBe(false);
+  });
+
+  it('项目模式卸载：全局文件仍有其他信任记录时保留备份，全部清空后才删除', () => {
+    const globalFile = path.join(home, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(globalFile));
+    fs.writeFileSync(globalFile, '[projects."/r"]\ntrust_level = "trusted"\n');
+    const projectFileA = path.join(home, 'a', '.codex', 'config.toml');
+    const projectFileB = path.join(home, 'b', '.codex', 'config.toml');
+    installProjectCodex(projectFileA);
+    installProjectCodex(projectFileB);
+    expect(fs.existsSync(globalFile + '.aicode.bak')).toBe(true);
+
+    uninstallProjectCodex(projectFileA);
+    expect(fs.existsSync(globalFile + '.aicode.bak')).toBe(true); // 项目 B 的信任记录还在
+    uninstallProjectCodex(projectFileB);
+    expect(fs.existsSync(globalFile + '.aicode.bak')).toBe(false); // 全部清空后才删除
   });
 });

@@ -69,8 +69,16 @@ export function planProject(cwd: string, uninstall: boolean): Plan {
   const hookFile = projectHookPath(root);
 
   if (uninstall) {
-    steps.push({ file: claudeFile, summary: '移除 aicode 钩子', apply: () => uninstallClaude(claudeFile) });
-    steps.push({ file: codexFile, summary: '移除 aicode 钩子区块，并删除 ~/.codex/config.toml 中该项目的信任区块', apply: () => uninstallProjectCodex(codexFile) });
+    if (isTracked(root, PROJECT_CLAUDE)) {
+      notes.push(`${PROJECT_CLAUDE} 已被 git 跟踪，未被 aicode 修改过，已跳过`);
+    } else {
+      steps.push({ file: claudeFile, summary: '移除 aicode 钩子', apply: () => uninstallClaude(claudeFile) });
+    }
+    if (isTracked(root, PROJECT_CODEX)) {
+      notes.push(`${PROJECT_CODEX} 已被 git 跟踪，未被 aicode 修改过，已跳过`);
+    } else {
+      steps.push({ file: codexFile, summary: '移除 aicode 钩子区块，并删除 ~/.codex/config.toml 中该项目的信任区块', apply: () => uninstallProjectCodex(codexFile) });
+    }
     steps.push({ file: excludeFile, summary: '移除 aicode 写入的忽略条目', apply: () => removeExclude(root) });
     steps.push({ file: hookFile, summary: '删除 aicode 的 post-commit，恢复原有 hook', apply: () => uninstallProjectGitHook(root) });
     return { steps, notes };
@@ -82,7 +90,7 @@ export function planProject(cwd: string, uninstall: boolean): Plan {
     notes.push(`${PROJECT_CLAUDE} 已被 git 跟踪，为避免改动团队共享配置已跳过 Claude Code；可改用全局模式`);
   } else {
     steps.push({ file: claudeFile, summary: '合并 PreToolUse/PostToolUse 钩子', apply: () => installClaude(claudeFile) });
-    excludes.push(`/${PROJECT_CLAUDE}`);
+    excludes.push(`/${PROJECT_CLAUDE}`, `/${PROJECT_CLAUDE}.aicode.bak`);
   }
   if (isTracked(root, PROJECT_CODEX)) {
     notes.push(`${PROJECT_CODEX} 已被 git 跟踪，已跳过 Codex；可改用全局模式`);
@@ -94,7 +102,7 @@ export function planProject(cwd: string, uninstall: boolean): Plan {
       summary: '写入项目钩子；并在全局 ~/.codex/config.toml 追加该项目的信任区块（Codex 只认全局文件中的信任记录；先备份为 .aicode.bak，卸载时删除该区块）',
       apply: () => installProjectCodex(codexFile),
     });
-    excludes.push(`/${PROJECT_CODEX}`);
+    excludes.push(`/${PROJECT_CODEX}`, `/${PROJECT_CODEX}.aicode.bak`);
   }
   if (excludes.length) {
     steps.push({ file: excludeFile, summary: `追加忽略条目 ${excludes.join(' ')}，避免出现在 git status 中`, apply: () => addExclude(root, excludes) });
