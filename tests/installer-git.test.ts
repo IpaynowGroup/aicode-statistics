@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { gitCommonDir, isTracked, localHooksPath } from '../src/git.js';
 import { addExclude, removeExclude } from '../src/installer/exclude.js';
 import {
-  installGitHooks, installProjectGitHook, projectHookPath, renderForwarder, uninstallGitHooks, uninstallProjectGitHook,
+  HOOK_NAMES, installGitHooks, installProjectGitHook, projectHookPath, renderForwarder, uninstallGitHooks, uninstallProjectGitHook,
 } from '../src/installer/git.js';
 import { gitHooksDir } from '../src/paths.js';
 import { commitAll, initRepo, sh, tmpHome } from './helpers.js';
@@ -51,6 +51,18 @@ describe('exclude', () => {
     expect(sh(repo, ['status', '--porcelain'])).toBe('');
     removeExclude(repo);
     expect(fs.readFileSync(file, 'utf8')).toBe(original);
+  });
+});
+
+describe('HOOK_NAMES', () => {
+  it('包含服务端与 Perforce 钩子，不含 push-to-checkout（见 F7）', () => {
+    for (const name of [
+      'pre-receive', 'update', 'proc-receive', 'post-receive', 'post-update', 'post-index-change',
+      'p4-changelist', 'p4-prepare-changelist', 'p4-post-changelist', 'p4-pre-submit',
+    ]) {
+      expect(HOOK_NAMES).toContain(name);
+    }
+    expect(HOOK_NAMES).not.toContain('push-to-checkout');
   });
 });
 

@@ -20,6 +20,12 @@ describe('planGlobal', () => {
     ]);
     expect(plan.notes.join('\n')).toContain('未检测到 Codex');
   });
+
+  it('安装时提示 pre-commit 限制与 node 路径写死的注意事项（见 F7）', () => {
+    const notes = planGlobal(false).notes.join('\n');
+    expect(notes).toContain('pre-commit');
+    expect(notes).toContain('aicode init');
+  });
 });
 
 describe('planProject', () => {

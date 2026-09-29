@@ -80,3 +80,5 @@ export default (options) => ({
 - 上报只在 commit 时触发；长时间没有 commit 时，积压的事件不会主动补发
 - AI 执行 shell 命令期间，人工对同一仓库的改动会被计为 AI 改动
 - rebase / squash / cherry-pick 后不迁移归属；amend 会生成一条 `amend: true` 的新事件
+- 全局模式设置了 `core.hooksPath` 后，`pre-commit`（Python 框架）会拒绝执行 `pre-commit install`；需要先 `aicode init --uninstall` 或手动处理
+- 钩子脚本里写死了安装时的 node 绝对路径；升级或切换 node（如用 nvm）后，需要重新执行一次 `aicode init` 才能生效

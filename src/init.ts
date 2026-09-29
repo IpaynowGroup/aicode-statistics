@@ -54,7 +54,11 @@ export function planGlobal(uninstall: boolean): Plan {
     summary: uninstall ? '恢复原来的全局 core.hooksPath，删除转发脚本' : '设置全局 core.hooksPath=~/.aicode/git-hooks，并生成转发到原有 hook 的脚本',
     apply: () => (uninstall ? uninstallGitHooks() : installGitHooks()),
   });
-  if (!uninstall) notes.push('仓库级设置了 core.hooksPath 的仓库（如 husky）不会触发 commit 统计');
+  if (!uninstall) {
+    notes.push('仓库级设置了 core.hooksPath 的仓库（如 husky）不会触发 commit 统计');
+    notes.push('设置了全局 core.hooksPath 后，pre-commit（Python 框架）会拒绝执行 pre-commit install；需要先卸载或手动处理');
+    notes.push('钩子脚本里写死了安装时的 node 绝对路径；升级或切换 node（如用 nvm）后，需要重新执行一次 aicode init');
+  }
   return { steps, notes };
 }
 

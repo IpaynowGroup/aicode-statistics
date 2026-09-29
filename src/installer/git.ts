@@ -6,10 +6,13 @@ import { gitCommonDir, tryGit } from '../git.js';
 import { gitHooksDir, installStatePath } from '../paths.js';
 import { aicodeCommand, shq } from './shell.js';
 
+// push-to-checkout 不在列表中：仅它存在就会关闭 git 的 updateInstead 默认行为，即使脚本只是透传原 hook（见 F7）
 export const HOOK_NAMES = [
   'applypatch-msg', 'pre-applypatch', 'post-applypatch', 'pre-commit', 'pre-merge-commit', 'prepare-commit-msg',
   'commit-msg', 'post-commit', 'pre-rebase', 'post-checkout', 'post-merge', 'pre-push', 'post-rewrite',
-  'pre-auto-gc', 'push-to-checkout', 'sendemail-validate', 'reference-transaction',
+  'pre-auto-gc', 'sendemail-validate', 'reference-transaction',
+  'pre-receive', 'update', 'proc-receive', 'post-receive', 'post-update', 'post-index-change',
+  'p4-changelist', 'p4-prepare-changelist', 'p4-post-changelist', 'p4-pre-submit',
 ];
 const PROJECT_MARK = '# aicode project post-commit';
 // 同步捕获本次 commit 的信息，避免后台统计进程读到晚到的 HEAD/分支（见 F1）
