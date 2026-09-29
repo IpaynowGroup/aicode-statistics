@@ -200,4 +200,37 @@ describe('Codex 安装器', () => {
     uninstallProjectCodex(projectFileB);
     expect(fs.existsSync(globalFile + '.aicode.bak')).toBe(false); // 全部清空后才删除
   });
+
+  it('全局卸载：项目信任记录还在时保留共享备份，全部清空后才删除（见 R3）', () => {
+    const globalFile = path.join(home, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(globalFile), { recursive: true });
+    fs.writeFileSync(globalFile, 'model = "x"\n'); // 用户原有内容
+    installCodex(globalFile); // 全局钩子也装在这份文件里，触发一次备份
+    expect(fs.existsSync(globalFile + '.aicode.bak')).toBe(true);
+
+    const projectFile = path.join(home, 'r', '.codex', 'config.toml');
+    installProjectCodex(projectFile); // 往同一份全局文件追加项目的信任记录
+
+    uninstallCodex(globalFile); // 直接对全局文件做 aicode 卸载（init.ts 的全局卸载路径）
+    const text = fs.readFileSync(globalFile, 'utf8');
+    expect(text).not.toContain('# >>> aicode hooks >>>');
+    expect(text).toContain('# >>> aicode trust '); // 项目信任记录还在
+    expect(fs.existsSync(globalFile + '.aicode.bak')).toBe(true); // 因此不能删备份
+
+    uninstallProjectCodex(projectFile); // 清掉最后的信任记录
+    expect(fs.readFileSync(globalFile, 'utf8')).not.toContain('# >>> aicode trust ');
+    expect(fs.existsSync(globalFile + '.aicode.bak')).toBe(false); // 全部清空后才删除
+  });
+
+  it('backupOnce：文件已含信任记录即视为 aicode 已管理，不再新建备份（见 R3）', () => {
+    const globalFile = path.join(home, '.codex', 'config.toml');
+    fs.mkdirSync(path.dirname(globalFile), { recursive: true });
+    // 模拟：此前只通过 installProjectCodex 写过信任记录，从未对全局文件本身装过钩子
+    fs.writeFileSync(
+      globalFile,
+      ['# >>> aicode trust /r/.codex/config.toml >>>', '# <<< aicode trust /r/.codex/config.toml <<<', ''].join('\n'),
+    );
+    installCodex(globalFile);
+    expect(fs.existsSync(globalFile + '.aicode.bak')).toBe(false);
+  });
 });

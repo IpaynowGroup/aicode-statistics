@@ -104,8 +104,9 @@ function readOrEmpty(file: string): string {
 
 function backupOnce(file: string): void {
   if (!fs.existsSync(file) || fs.existsSync(file + '.aicode.bak')) return;
-  // 文件内容已含 aicode 标记，说明是本工具自己创建/管理的，不是用户原有文件，无需备份
-  if (fs.readFileSync(file, 'utf8').includes(BEGIN)) return;
+  // 文件内容已含 aicode 标记（钩子区块或信任区块），说明是本工具自己创建/管理的，不是用户原有文件，无需备份
+  const text = fs.readFileSync(file, 'utf8');
+  if (text.includes(BEGIN) || /# >>> aicode trust /.test(text)) return;
   fs.copyFileSync(file, file + '.aicode.bak');
 }
 
@@ -154,7 +155,8 @@ export function uninstallCodex(configFile: string): void {
   // 文件由 aicode 创建（无备份）且已清空时直接删除
   if (text.trim() === '' && !fs.existsSync(bak)) fs.unlinkSync(configFile);
   else fs.writeFileSync(configFile, text);
-  if (fs.existsSync(bak)) fs.unlinkSync(bak); // 卸载成功，备份不再需要
+  // 该文件可能还被某个项目的信任记录占用（见 installProjectCodex），全部清空后共享备份才不再需要（镜像 uninstallProjectCodex 的守卫）
+  if (fs.existsSync(bak) && !/# >>> aicode trust /.test(text)) fs.unlinkSync(bak);
 }
 
 /** Codex 只为已信任的项目加载项目级 .codex/config.toml */
