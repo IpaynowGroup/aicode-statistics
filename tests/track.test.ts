@@ -2,9 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { readGlobalConfig, updateGlobalConfig } from '../src/config.js';
+import { repoId } from '../src/git.js';
 import { configPath } from '../src/paths.js';
 import {
-  describeTrack, isRepoTracked, setTrackAll, trackRepo, untrackRepo,
+  addToTrackList, describeTrack, isRepoTracked, removeFromTrackList, setTrackAll, trackRepo, untrackRepo,
 } from '../src/track.js';
 import { initRepo, sh, tmpHome } from './helpers.js';
 
@@ -30,6 +31,47 @@ describe('updateGlobalConfig', () => {
     });
     expect(fs.statSync(path.dirname(configPath())).mode & 0o777).toBe(0o700);
     expect(readGlobalConfig().track).toEqual({ mode: 'all', repos: [] });
+  });
+
+  it('文件存在但 JSON 损坏时拒绝写入：原文件字节不变，且抛错（不静默覆盖 reporter/密码等字段）', () => {
+    fs.mkdirSync(path.dirname(configPath()), { recursive: true });
+    const corrupt = '{ "reporter": { "type": "mysql", "options": { "password": "secret" } }, }'; // 尾随逗号，非法 JSON
+    fs.writeFileSync(configPath(), corrupt);
+    expect(() => updateGlobalConfig((raw) => {
+      raw.track = { mode: 'list', repos: ['x'] };
+    })).toThrow('解析失败');
+    expect(fs.readFileSync(configPath(), 'utf8')).toBe(corrupt);
+    expect(fs.existsSync(`${configPath()}.tmp`)).toBe(false);
+  });
+
+  it('文件解析结果不是普通对象（如数组）时同样拒绝写入', () => {
+    fs.mkdirSync(path.dirname(configPath()), { recursive: true });
+    const notObject = '[1, 2, 3]';
+    fs.writeFileSync(configPath(), notObject);
+    expect(() => updateGlobalConfig(() => {})).toThrow('解析失败');
+    expect(fs.readFileSync(configPath(), 'utf8')).toBe(notObject);
+  });
+
+  it('写入后不留 .tmp 临时文件，文件权限为 600', () => {
+    updateGlobalConfig((raw) => {
+      raw.track = { mode: 'list', repos: ['y'] };
+    });
+    expect(fs.existsSync(`${configPath()}.tmp`)).toBe(false);
+    expect(fs.statSync(configPath()).mode & 0o777).toBe(0o600);
+  });
+});
+
+describe('readGlobalConfig 对非普通对象的解析结果返回空对象', () => {
+  it('顶层是 null', () => {
+    fs.mkdirSync(path.dirname(configPath()), { recursive: true });
+    fs.writeFileSync(configPath(), 'null');
+    expect(readGlobalConfig()).toEqual({});
+  });
+
+  it('顶层是数组', () => {
+    fs.mkdirSync(path.dirname(configPath()), { recursive: true });
+    fs.writeFileSync(configPath(), '[1,2]');
+    expect(readGlobalConfig()).toEqual({});
   });
 });
 
@@ -85,5 +127,34 @@ describe('trackRepo / isRepoTracked / untrackRepo', () => {
     const repo = repoWithOrigin('git@gitlab.example.com:group/described.git');
     const { id } = trackRepo(repo);
     expect(describeTrack()).toContain(id);
+  });
+
+  it('全局配置损坏时，trackRepo 抛错且不覆盖原文件（对应 aicode track / init --local 场景）', () => {
+    const repo = repoWithOrigin('git@gitlab.example.com:group/corrupt.git');
+    fs.mkdirSync(path.dirname(configPath()), { recursive: true });
+    const corrupt = '{ "reporter": { "type": "mysql", "options": { "password": "secret" } }, }';
+    fs.writeFileSync(configPath(), corrupt);
+    expect(() => trackRepo(repo)).toThrow('解析失败');
+    expect(fs.readFileSync(configPath(), 'utf8')).toBe(corrupt);
+  });
+
+  it('removeFromTrackList：仓库不在名单中时不写入，不创建 ~/.aicode/config.json（对应 init --local --uninstall 场景）', () => {
+    const repo = repoWithOrigin('git@gitlab.example.com:group/never-tracked.git');
+    removeFromTrackList(repo);
+    expect(fs.existsSync(configPath())).toBe(false);
+
+    trackRepo(repo);
+    untrackRepo(repo);
+    const before = fs.readFileSync(configPath(), 'utf8');
+    removeFromTrackList(repo); // 已经不在名单中，再次调用不应改动文件
+    expect(fs.readFileSync(configPath(), 'utf8')).toBe(before);
+  });
+
+  it('addToTrackList/removeFromTrackList 只增删名单、不改变 mode', () => {
+    const repo = repoWithOrigin('git@gitlab.example.com:group/list-only.git');
+    addToTrackList(repo);
+    expect(readGlobalConfig().track).toEqual({ mode: 'all', repos: [repoId(repo)] });
+    removeFromTrackList(repo);
+    expect(readGlobalConfig().track).toEqual({ mode: 'all', repos: [] });
   });
 });

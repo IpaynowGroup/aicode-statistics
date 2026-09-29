@@ -14,6 +14,14 @@ describe('loadConfig', () => {
     });
   });
 
+  it('loadConfig().track 每次都是新对象，修改一次的结果不会污染下一次调用（见默认值防污染）', () => {
+    const first = loadConfig(null).track;
+    first.repos.push('mutated');
+    first.mode = 'list';
+    const second = loadConfig(null).track;
+    expect(second).toEqual({ mode: 'all', repos: [] });
+  });
+
   it('仓库级 .aicode.json 写 track 不生效（只认全局配置）', () => {
     writeDefaultConfig();
     const global = JSON.parse(fs.readFileSync(configPath(), 'utf8'));

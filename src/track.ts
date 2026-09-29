@@ -1,15 +1,10 @@
-import { readGlobalConfig, updateGlobalConfig, type TrackConfig } from './config.js';
+import { defaultTrack, isTrackConfig, readGlobalConfig, updateGlobalConfig, type TrackConfig } from './config.js';
 import { repoId } from './git.js';
-
-const DEFAULT_TRACK: TrackConfig = { mode: 'all', repos: [] };
 
 /** 与 config.ts 中 readJson 的校验一致：字段类型错误时退回默认值（全部统计） */
 function getTrack(raw: Record<string, unknown>): TrackConfig {
-  const t = raw.track as Partial<TrackConfig> | undefined;
-  if (t && (t.mode === 'all' || t.mode === 'list') && Array.isArray(t.repos) && t.repos.every((r) => typeof r === 'string')) {
-    return { mode: t.mode, repos: [...t.repos] };
-  }
-  return { ...DEFAULT_TRACK };
+  const t = raw.track;
+  return isTrackConfig(t) ? { mode: t.mode, repos: [...t.repos] } : defaultTrack();
 }
 
 export function isRepoTracked(root: string): boolean {
@@ -56,9 +51,10 @@ export function addToTrackList(root: string): void {
   });
 }
 
-/** 只删，不改变 mode；供 init --local 卸载时使用 */
+/** 只删，不改变 mode；供 init --local 卸载时使用。仓库不在名单中时不写入（不创建 ~/.aicode/config.json） */
 export function removeFromTrackList(root: string): void {
   const id = repoId(root);
+  if (!getTrack(readGlobalConfig()).repos.includes(id)) return;
   updateGlobalConfig((raw) => {
     const track = getTrack(raw);
     const idx = track.repos.indexOf(id);
