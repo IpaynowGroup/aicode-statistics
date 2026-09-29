@@ -140,7 +140,11 @@ function unquotePath(raw: string): string {
   for (let i = 0; i < inner.length; i++) {
     const c = inner[i];
     if (c !== '\\') {
-      bytes.push(c.charCodeAt(0));
+      // 非转义字符按 UTF-8 编码取字节（而非 charCodeAt，否则非 ASCII 码点会被当成单字节截断），
+      // 兼容 core.quotepath=false 时路径里出现的原始非 ASCII 字符
+      const cp = inner.codePointAt(i)!;
+      for (const b of Buffer.from(String.fromCodePoint(cp), 'utf8')) bytes.push(b);
+      if (cp > 0xffff) i++; // 跳过代理对占用的第二个 UTF-16 code unit
       continue;
     }
     const next = inner[i + 1];

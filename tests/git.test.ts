@@ -61,6 +61,14 @@ describe('parseUnifiedDiff', () => {
       { path: 'img.png', oldPath: null, added: [], deleted: 0, binary: true },
     ]);
   });
+
+  it('去引号时按 UTF-8 正确还原原始非 ASCII 字符（core.quotepath=false）（见 R5）', () => {
+    const text = [
+      'diff --git a/x b/x',
+      '+++ "b/中文\\"x.ts"',
+    ].join('\n');
+    expect(parseUnifiedDiff(text)[0].path).toBe('中文"x.ts');
+  });
 });
 
 describe('仓库操作', () => {
