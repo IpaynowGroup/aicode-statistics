@@ -6,7 +6,7 @@ import { installClaude, uninstallClaude } from './installer/claude.js';
 import { installCodex, installProjectCodex, isCodexTrusted, uninstallCodex, uninstallProjectCodex } from './installer/codex.js';
 import { addExclude, removeExclude } from './installer/exclude.js';
 import {
-  installGitHooks, installProjectGitHook, projectHookPath, uninstallGitHooks, uninstallProjectGitHook,
+  installGitHooks, installProjectGitHook, isAicodeHook, projectHookPath, uninstallGitHooks, uninstallProjectGitHook,
 } from './installer/git.js';
 import { aicodeHome, claudeSettingsPath, codexHome, configPath, ledgerDir, logPath, pendingDir } from './paths.js';
 
@@ -80,6 +80,9 @@ export function planProject(cwd: string, uninstall: boolean): Plan {
       steps.push({ file: codexFile, summary: '移除 aicode 钩子区块，并删除 ~/.codex/config.toml 中该项目的信任区块', apply: () => uninstallProjectCodex(codexFile) });
     }
     steps.push({ file: excludeFile, summary: '移除 aicode 写入的忽略条目', apply: () => removeExclude(root) });
+    if (fs.existsSync(hookFile) && !isAicodeHook(hookFile) && fs.existsSync(hookFile + '.aicode-orig')) {
+      notes.push('post-commit 已被其他工具替换，无法安全恢复 aicode 安装前的 hook，将保留两者，请手动处理 post-commit.aicode-orig');
+    }
     steps.push({ file: hookFile, summary: '删除 aicode 的 post-commit，恢复原有 hook', apply: () => uninstallProjectGitHook(root) });
     return { steps, notes };
   }

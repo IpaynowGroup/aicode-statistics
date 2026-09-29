@@ -119,4 +119,26 @@ describe('项目模式', () => {
     uninstallProjectGitHook(repo);
     expect(fs.existsSync(projectHookPath(repo))).toBe(false);
   });
+
+  it('安装时：hook 已被其他工具替换且已存在旧的 .aicode-orig 备份，拒绝覆盖并报错（见 F6）', () => {
+    const repo = initRepo();
+    const hook = projectHookPath(repo);
+    fs.writeFileSync(hook, '#!/bin/sh\necho mine\n', { mode: 0o755 });
+    fs.writeFileSync(hook + '.aicode-orig', '#!/bin/sh\necho stale-backup\n', { mode: 0o755 });
+    expect(() => installProjectGitHook(repo)).toThrow(/post-commit 已被其他工具替换/);
+    // 拒绝后不能改动现场
+    expect(fs.readFileSync(hook, 'utf8')).toContain('echo mine');
+    expect(fs.readFileSync(hook + '.aicode-orig', 'utf8')).toContain('echo stale-backup');
+  });
+
+  it('卸载时：hook 已被其他工具替换（非 aicode），不删除对方的 hook，也不用旧备份覆盖它（见 F6）', () => {
+    const repo = initRepo();
+    const hook = projectHookPath(repo);
+    fs.writeFileSync(hook, '#!/bin/sh\necho original\n', { mode: 0o755 }); // 仓库原有的 hook
+    installProjectGitHook(repo); // 正常安装，把原有 hook 备份为 .aicode-orig
+    fs.writeFileSync(hook, '#!/bin/sh\necho replaced-by-other-tool\n', { mode: 0o755 }); // 之后被其他工具替换
+    uninstallProjectGitHook(repo);
+    expect(fs.readFileSync(hook, 'utf8')).toContain('echo replaced-by-other-tool'); // 对方的 hook 原样保留
+    expect(fs.existsSync(hook + '.aicode-orig')).toBe(true); // 备份也保留，交给用户手动处理
+  });
 });

@@ -111,7 +111,7 @@ export function renderProjectPostCommit(origPath: string, commitCommand: string)
   ].join('\n') + '\n';
 }
 
-function isAicodeHook(file: string): boolean {
+export function isAicodeHook(file: string): boolean {
   try {
     return fs.readFileSync(file, 'utf8').includes(PROJECT_MARK);
   } catch {
@@ -123,7 +123,13 @@ export function installProjectGitHook(repo: string): void {
   const hook = projectHookPath(repo);
   const orig = hook + '.aicode-orig';
   fs.mkdirSync(path.dirname(hook), { recursive: true });
-  if (fs.existsSync(hook) && !isAicodeHook(hook) && !fs.existsSync(orig)) fs.renameSync(hook, orig);
+  if (fs.existsSync(hook) && !isAicodeHook(hook)) {
+    if (fs.existsSync(orig)) {
+      // hook 已被其他工具替换，且已有一份旧备份：直接覆盖会连同对方的 hook 一起丢失，改为中止让用户手动处理
+      throw new Error('post-commit 已被其他工具替换，且存在旧的 post-commit.aicode-orig，请先手动处理');
+    }
+    fs.renameSync(hook, orig);
+  }
   fs.writeFileSync(hook, renderProjectPostCommit(orig, aicodeCommand('commit')));
   fs.chmodSync(hook, 0o755);
 }
@@ -132,5 +138,7 @@ export function uninstallProjectGitHook(repo: string): void {
   const hook = projectHookPath(repo);
   const orig = hook + '.aicode-orig';
   if (isAicodeHook(hook)) fs.unlinkSync(hook);
-  if (fs.existsSync(orig)) fs.renameSync(orig, hook);
+  // 只有 post-commit 已不存在（即上一步确实是 aicode 的 hook）才恢复备份；
+  // 如果 hook 已被其他工具替换，恢复备份会覆盖对方的 hook，保留两者交由用户手动处理
+  if (fs.existsSync(orig) && !fs.existsSync(hook)) fs.renameSync(orig, hook);
 }

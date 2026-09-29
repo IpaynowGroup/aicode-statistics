@@ -80,6 +80,20 @@ describe('planProject', () => {
     expect(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8')).toBe(original);
   });
 
+  it('卸载时 post-commit 已被其他工具替换：提示用户手动处理，且不覆盖对方的 hook（见 F6）', () => {
+    const repo = initRepo();
+    const hookFile = path.join(repo, '.git', 'hooks', 'post-commit');
+    fs.writeFileSync(hookFile, '#!/bin/sh\necho original\n', { mode: 0o755 }); // 仓库原有的 hook
+    applyAll(planProject(repo, false)); // 安装时把原有 hook 备份为 .aicode-orig
+    fs.writeFileSync(hookFile, '#!/bin/sh\necho replaced-by-other-tool\n', { mode: 0o755 }); // 之后被其他工具替换
+
+    const plan = planProject(repo, true);
+    expect(plan.notes.join('\n')).toContain('已被其他工具替换');
+    applyAll(plan);
+    expect(fs.readFileSync(hookFile, 'utf8')).toContain('echo replaced-by-other-tool');
+    expect(fs.existsSync(hookFile + '.aicode-orig')).toBe(true);
+  });
+
   it('跳过已被 git 跟踪的配置文件和未信任的 Codex 项目，并提示仓库级 hooksPath', () => {
     const repo = initRepo();
     fs.mkdirSync(path.join(repo, '.claude'));
