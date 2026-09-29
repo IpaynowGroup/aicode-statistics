@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { planGlobal, planProject } from '../src/init.js';
 import { commitAll, initRepo, sh, tmpHome } from './helpers.js';
@@ -25,6 +26,12 @@ describe('planGlobal', () => {
     const notes = planGlobal(false).notes.join('\n');
     expect(notes).toContain('pre-commit');
     expect(notes).toContain('aicode init');
+  });
+
+  it('~/.aicode 目录权限设为 700，已存在时也会收紧（见 F8）', () => {
+    fs.mkdirSync(path.join(home, '.aicode'), { recursive: true, mode: 0o755 });
+    applyAll(planGlobal(false));
+    expect(fs.statSync(path.join(home, '.aicode')).mode & 0o777).toBe(0o700);
   });
 });
 
@@ -84,6 +91,18 @@ describe('planProject', () => {
     expect(plan.notes.join('\n')).toContain('已被 git 跟踪');
     applyAll(plan);
     expect(fs.readFileSync(path.join(repo, '.claude', 'settings.local.json'), 'utf8')).toBe(original);
+  });
+
+  it('在 linked worktree 中，展示的 exclude 路径使用公共 git 目录（见 F8）', () => {
+    const repo = initRepo();
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+    commitAll(repo, 'init');
+    const wt = path.join(repo, '..', `wt-${path.basename(repo)}`);
+    // 用 execFileSync 而非 sh，以便屏蔽 git worktree add 直接写终端的进度提示（stdio: ignore）
+    execFileSync('git', ['worktree', 'add', wt, '-b', 'wt-branch'], { cwd: repo, stdio: 'ignore' });
+    const plan = planProject(wt, false);
+    const excludeStep = plan.steps.find((s) => s.file.endsWith(path.join('info', 'exclude')));
+    expect(excludeStep?.file).toBe(path.join(repo, '.git', 'info', 'exclude'));
   });
 
   it('卸载时 post-commit 已被其他工具替换：提示用户手动处理，且不覆盖对方的 hook（见 F6）', () => {

@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { ReporterConfig } from '../config.js';
 import { markReported, readUnreported, type CommitEvent } from '../events.js';
@@ -23,7 +24,15 @@ export async function loadReporter(cfg: ReporterConfig): Promise<Reporter> {
     const { createMysqlReporter } = await import('./mysql.js');
     return createMysqlReporter(cfg.options ?? {});
   }
-  if (cfg.type !== 'module' || !cfg.module) return noopReporter;
+  if (cfg.type !== 'module') return noopReporter;
+  if (!cfg.module) {
+    logError('reporter', new Error('type=module 时缺少 module 字段'));
+    return noopReporter;
+  }
+  if (!path.isAbsolute(cfg.module)) {
+    logError('reporter', new Error(`type=module 的 module 必须是绝对路径: ${cfg.module}`));
+    return noopReporter;
+  }
   const mod = (await import(/* @vite-ignore */ pathToFileURL(cfg.module).href)) as {
     default: (options: Record<string, unknown>) => Reporter;
   };

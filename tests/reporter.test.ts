@@ -3,6 +3,7 @@ import path from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { appendEvent, hasEvent, readUnreported, type CommitEvent } from '../src/events.js';
 import { flushEvents, loadReporter, noopReporter, type Reporter } from '../src/reporter/index.js';
+import { logPath } from '../src/paths.js';
 import { tmpHome } from './helpers.js';
 
 const ev = (id: string): CommitEvent => ({
@@ -44,6 +45,18 @@ describe('reporter', () => {
     appendEvent(ev('b'));
     await flushEvents(await loadReporter({ type: 'module', module: mod, options: { out } }));
     expect(fs.readFileSync(out, 'utf8')).toBe('a\nb\n');
+  });
+
+  it('type=module 但 module 是相对路径时记日志并回退 noop（见 F8）', async () => {
+    const reporter = await loadReporter({ type: 'module', module: './my-reporter.mjs' });
+    expect(reporter).toBe(noopReporter);
+    expect(fs.readFileSync(logPath(), 'utf8')).toContain('绝对路径');
+  });
+
+  it('type=module 但缺少 module 字段时记日志并回退 noop（见 F8）', async () => {
+    const reporter = await loadReporter({ type: 'module' });
+    expect(reporter).toBe(noopReporter);
+    expect(fs.readFileSync(logPath(), 'utf8')).toContain('缺少 module');
   });
 
   it('上报失败时停止，失败的事件保留，下次补发；无论成败都调用 close', async () => {

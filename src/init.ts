@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { writeDefaultConfig } from './config.js';
-import { isTracked, localHooksPath, repoRoot } from './git.js';
+import { gitCommonDir, isTracked, localHooksPath, repoRoot } from './git.js';
 import { installClaude, uninstallClaude } from './installer/claude.js';
 import { installCodex, installProjectCodex, isCodexTrusted, uninstallCodex, uninstallProjectCodex } from './installer/codex.js';
 import { addExclude, removeExclude } from './installer/exclude.js';
@@ -20,9 +20,10 @@ const HUSKY_NOTE = (p: string) => `该仓库设置了仓库级 core.hooksPath=${
 function homeStep(): Step {
   return {
     file: configPath(),
-    summary: '创建 ~/.aicode 目录结构；配置文件不存在时写入默认配置；把配置文件权限设为 600',
+    summary: '创建 ~/.aicode 目录结构（权限 700）；配置文件不存在时写入默认配置；把配置文件权限设为 600',
     apply: () => {
       for (const dir of [aicodeHome(), ledgerDir(), pendingDir(), path.dirname(logPath())]) fs.mkdirSync(dir, { recursive: true });
+      fs.chmodSync(aicodeHome(), 0o700); // 仅本人可访问；目录已存在时也重新收紧权限
       if (!fs.existsSync(configPath())) writeDefaultConfig();
       fs.chmodSync(configPath(), 0o600); // 可能包含数据库密码，仅本人可读写
     },
@@ -69,7 +70,7 @@ export function planProject(cwd: string, uninstall: boolean): Plan {
   const notes: string[] = [];
   const claudeFile = path.join(root, PROJECT_CLAUDE);
   const codexFile = path.join(root, PROJECT_CODEX);
-  const excludeFile = path.join(root, '.git', 'info', 'exclude');
+  const excludeFile = path.join(gitCommonDir(root), 'info', 'exclude'); // 兼容 worktree：exclude 实际位于公共 git 目录
   const hookFile = projectHookPath(root);
 
   if (uninstall) {
