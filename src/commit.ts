@@ -1,7 +1,7 @@
 import { analyzeCommit } from './analyzer.js';
 import { loadConfig } from './config.js';
 import { appendEvent, hasEvent, type CommitEvent } from './events.js';
-import { commitDiff, commitInfo, currentBranch, isAmend, repoId, repoKey, repoRoot } from './git.js';
+import { commitDiff, commitInfo, currentBranch, isAmend, repoId, repoKey, repoRoot, tryGit } from './git.js';
 import { buildIgnore } from './ignore.js';
 import { readRecords, withLock, writeRecords } from './ledger.js';
 import { commitModule, createModuleResolver, resolveOwner } from './metadata.js';
@@ -29,13 +29,15 @@ export async function runCommit(cwd: string, opts?: RunCommitOptions): Promise<C
 
   // hook 同步捕获的 reflog 优先于事后重新读取，避免读到晚到的状态（见 F1）
   const amend = opts?.reflog !== undefined ? opts.reflog.startsWith('commit (amend)') : isAmend(root);
+  // amend 场景下把旧 commit 名下已消费的 AI 行临时借回，保留其 AI 归属（见 F3）
+  const reusableSha = amend ? opts?.prev ?? tryGit(root, ['rev-parse', '-q', '--verify', 'HEAD@{1}'])?.trim() ?? undefined : undefined;
   const owner = resolveOwner(config, { name: info.authorName, email: info.authorEmail });
 
   const event = withLock(key, (): CommitEvent | null => {
     if (hasEvent(eventId)) return null; // 在锁内判重，避免两个进程同时统计
-    const r = analyzeCommit(diffs, readRecords(key), isIgnored, moduleOf);
+    const r = analyzeCommit(diffs, readRecords(key), isIgnored, moduleOf, info.sha, reusableSha);
     const cutoff = Math.floor(Date.now() / 1000) - LEDGER_TTL_SECONDS;
-    writeRecords(key, r.remaining.filter((rec) => rec.ts >= cutoff));
+    writeRecords(key, r.records.filter((rec) => rec.ts >= cutoff));
     const e: CommitEvent = {
       event_id: eventId,
       repo: id,

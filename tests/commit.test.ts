@@ -40,8 +40,30 @@ describe('runCommit', () => {
       files: [{ path: 'src/a.ts', module: 'login', added: 3, ai: 2 }],
     });
     expect(event!.stats).toMatchObject({ added_total: 3, added_ai: 2, added_human: 1, ai_generated: 3 });
-    expect(readRecords(key)).toEqual([]); // 已消费的被移除，过期的被清理
+    // 已消费的记录不再删除，改为标记归属本次 commit（供 amend 时借回）；过期的被清理
+    expect(readRecords(key)).toEqual([
+      expect.objectContaining({ p: 'src/a.ts', c: sha }),
+      expect.objectContaining({ p: 'src/a.ts', c: sha }),
+    ]);
     expect(fs.readFileSync(eventsPath(), 'utf8').trim().split('\n')).toHaveLength(1);
+  });
+
+  it('amend 保留原有 AI 行的归属：追加人工行后统计仍把原 AI 行计为 AI', async () => {
+    const repo = initRepo();
+    const key = repoKey(repoId(repo));
+    appendRecords(key, aiRecords('a.ts', 'const a = 1;\nconst b = 2;'));
+    fs.writeFileSync(path.join(repo, 'a.ts'), 'const a = 1;\nconst b = 2;\n');
+    commitAll(repo, 'feat: 初次提交');
+    const beforeAmend = await runCommit(repo);
+    expect(beforeAmend!.stats).toMatchObject({ added_ai: 2, added_human: 0 });
+
+    fs.writeFileSync(path.join(repo, 'a.ts'), 'const a = 1;\nconst b = 2;\nconst human = true;\n');
+    sh(repo, ['commit', '-q', '-a', '--amend', '-m', 'feat: 初次提交（amend）']);
+    const afterAmend = await runCommit(repo);
+
+    expect(afterAmend).not.toBeNull();
+    expect(afterAmend!.amend).toBe(true);
+    expect(afterAmend!.stats).toMatchObject({ added_total: 3, added_ai: 2, added_human: 1 });
   });
 
   it('同一 commit 不重复统计', async () => {

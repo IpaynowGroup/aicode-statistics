@@ -126,9 +126,9 @@
 ```
 
 - `repo_id`：取 origin remote 的 `host/group/project`；没有 remote 时为 `local:<仓库根目录绝对路径>`。`repo_key` 取 `repo_id` 的 sha1 前 16 位，用作文件名
-- ledger 每行一条记录：`{"p":"src/login.ts","f":"a1b2c3d4e5f6","t":"claude-code","m":"claude-opus-5-5","s":"<session>","ts":1727143200}`
+- ledger 每行一条记录：`{"p":"src/login.ts","f":"a1b2c3d4e5f6","t":"claude-code","m":"claude-opus-5-5","s":"<session>","ts":1727143200,"c":"<消费该记录的 commit sha，可选>"}`。`c` 标记该记录已被哪次 commit 消费；amend 产生新 commit 时，旧 commit（`HEAD@{1}`）名下的记录会被临时借回参与匹配，重新匹配上则把 `c` 改为新 commit 的 sha，没匹配上则清空 `c` 放回未消费状态（见 §6.1）
 - 并发控制：`hook post` 追加写入和 `commit` 改写 ledger，都要先获取 `ledger/<repo_key>.lock`（用 `O_EXCL` 创建，超过 10 秒视为陈旧锁并接管）。`commit` 是先写临时文件再 rename 替换，如果追加写入不加锁，期间追加的记录会丢失
-- 清理：`commit` 改写 ledger 时，丢弃超过 7 天仍未被消费的记录
+- 清理：`commit` 改写 ledger 时，丢弃超过 7 天的记录，不论是否已被消费（`c` 不影响 TTL）
 
 ## 6. commit 统计
 
@@ -168,7 +168,7 @@
 
 - `added_total` 只统计归一化后的有效行、且未被忽略规则命中的文件，等于 `added_ai + added_human`
 - `ai_generated`：统计开始时，ledger 中属于本次 commit 所涉及文件的记录总数；`ai_accept_rate = added_ai / ai_generated`。这是近似值：同一文件的 AI 改动如果分多次提交，未提交的部分也会被计入分母
-- `amend`：reflog 最新一条的信息以 `commit (amend)` 开头时为 true，由消费方决定是否去重
+- `amend`：reflog 最新一条的信息以 `commit (amend)` 开头时为 true，由消费方决定是否去重。此时旧 commit（`HEAD@{1}`）名下已消费的 ledger 记录会被临时借回参与本次匹配，从而保留原有 AI 行的归属（不会因为 amend 而误判为人工新增）：重新匹配上的记录改记为新 commit 的 sha，没匹配上的清空归属、放回未消费状态
 - merge commit（有多个父提交）直接跳过
 - 去重："该 commit 是否已统计"的检查放在 ledger 锁内进行。两种安装模式同时触发两次 `aicode commit` 时，只会生成一条事件
 - 二进制文件忽略；重命名的文件按新路径匹配

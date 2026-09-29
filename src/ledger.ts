@@ -2,8 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ledgerDir } from './paths.js';
 
-/** p=仓库相对路径 f=指纹 t=工具 m=模型 s=会话 ts=秒级时间戳 */
-export interface LedgerRecord { p: string; f: string; t: string; m: string; s: string; ts: number }
+/** p=仓库相对路径 f=指纹 t=工具 m=模型 s=会话 ts=秒级时间戳 c=消费该记录的 commit sha（amend 前可被同一次 amend 重新借用，见 analyzer.ts） */
+export interface LedgerRecord { p: string; f: string; t: string; m: string; s: string; ts: number; c?: string }
 
 const LOCK_STALE_MS = 10_000;
 const LOCK_WAIT_MS = 5_000;
