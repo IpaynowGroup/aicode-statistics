@@ -100,7 +100,16 @@ export function shellChanges(b: ShellBaseline, isIgnored: IgnoreFn, deadline: nu
     const after = readFingerprints(abs);
     if (!after) continue;
     // pre 时已改动的文件用 pre 的指纹；否则以 HEAD 版本为基线（新文件为空）
-    const before = prev ? prev.fps : fingerprintText(showFile(b.repoRoot, 'HEAD', rel, remainingMs(deadline)) ?? '');
+    let before: string[] | null;
+    if (prev) {
+      before = prev.fps;
+    } else {
+      const shown = showFile(b.repoRoot, 'HEAD', rel, remainingMs(deadline));
+      // showFile 经 tryGit 转发，进程超时（ETIMEDOUT）时也会返回 null，和"路径不在 HEAD 中"无法区分；
+      // 这里立即复查预算：超时只会发生在预算耗尽时，借此把超时与真正的新文件区分开，避免把超时误判为新文件全量计为 AI
+      checkDeadline(deadline);
+      before = fingerprintText(shown ?? '');
+    }
     if (!before) continue;
     const fps = multisetDiff(after, before);
     if (fps.length) changes.push({ repoRoot: b.repoRoot, rel, fps });
