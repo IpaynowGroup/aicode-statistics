@@ -2,6 +2,7 @@
 import readline from 'node:readline';
 import { runCommit } from './commit.js';
 import { loadConfig } from './config.js';
+import { countUnreported } from './events.js';
 import { repoRoot } from './git.js';
 import { runHook } from './hook.js';
 import { planGlobal, planProject } from './init.js';
@@ -122,13 +123,19 @@ function untrack(flags: string[]): number {
 async function sync(): Promise<number> {
   const config = loadConfig(null);
   const reporter = await loadReporter(config.reporter);
-  const result = await syncAll(reporter);
   if (reporter.name === 'noop') {
-    console.log(`未配置上报（reporter=noop），${result.remaining} 条事件保留在本地队列，配置后执行 aicode sync 即可补发`);
+    if (config.reporter.type !== 'noop') {
+      // 配置了非 noop 的 reporter，但加载失败回退到了 noop（如 type=module 缺字段、路径非法等）：
+      // 这是配置错误而非"未配置上报"，须提示并以非 0 退出，避免用户误以为已生效
+      console.log(`上报配置无效（type=${config.reporter.type}），请检查 ~/.aicode/config.json 或日志`);
+      return 1;
+    }
+    console.log(`未配置上报（reporter=noop），${countUnreported()} 条事件保留在本地队列，配置后执行 aicode sync 即可补发`);
     return 0;
   }
+  const result = await syncAll(reporter);
   console.log(`已上报 ${result.sent} 条，剩余 ${result.remaining} 条`);
-  if (result.error) {
+  if (result.failed) {
     console.log(`失败原因：${result.error}`);
     return 1;
   }

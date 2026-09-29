@@ -41,6 +41,19 @@ export async function loadReporter(cfg: ReporterConfig): Promise<Reporter> {
 
 export interface FlushResult { sent: number; failed: boolean; error?: string }
 
+/**
+ * 把任意 err 转成非空的错误描述：优先 message，其次 code（如 ECONNREFUSED），再退到 name，
+ * 最后兜底 String(err)。部分错误（如 Node 20 双栈 localhost 触发的 AggregateError）message 为空字符串，
+ * 不做兜底会导致 CLI/status 把失败误判成"无错误"。
+ */
+function describeError(err: unknown): string {
+  if (err instanceof Error) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return err.message || code || err.name || String(err);
+  }
+  return String(err) || '未知错误';
+}
+
 /** 按顺序补发未上报事件；遇到失败即停止，保证不乱序；结束时关闭 reporter */
 export async function flushEvents(reporter: Reporter, limit = 50): Promise<FlushResult> {
   let sent = 0;
@@ -48,6 +61,12 @@ export async function flushEvents(reporter: Reporter, limit = 50): Promise<Flush
   let error: string | undefined;
   try {
     for (const event of readUnreported(limit)) {
+      if (typeof event.event_id !== 'string' || !event.event_id) {
+        // 事件缺少合法 event_id：既无法上报也无法标记已上报，跳过它，避免污染真实事件的顺序，
+        // 也避免它被无限重试（配合 syncAll 的批次首元素重复检测，见控制器裁定）
+        logError(`report ${reporter.name}`, new Error('事件缺少合法 event_id，已跳过'));
+        continue;
+      }
       try {
         await reporter.report(event);
         markReported(event.event_id);
@@ -55,7 +74,7 @@ export async function flushEvents(reporter: Reporter, limit = 50): Promise<Flush
       } catch (err) {
         logError(`report ${reporter.name}`, err);
         failed = true;
-        error = err instanceof Error ? err.message : String(err);
+        error = describeError(err);
         break;
       }
     }

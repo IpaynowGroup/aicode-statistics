@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { AicodeConfig, ReporterConfig } from './config.js';
-import { countUnreported } from './events.js';
+import { countUnreported, readUnreported } from './events.js';
 import { syncStatePath } from './paths.js';
 import { flushEvents, type Reporter } from './reporter/index.js';
 import { describeTrack } from './track.js';
@@ -18,12 +18,29 @@ function defaultState(): SyncState {
   return { consecutiveFailures: 0 };
 }
 
+function isValidIsoDate(v: unknown): v is string {
+  return typeof v === 'string' && !Number.isNaN(Date.parse(v));
+}
+
+/** 把任意读到的字段收敛成合法 SyncState：字段类型不对或日期解析不了时退回默认值，绝不让脏状态文件影响退避计算 */
+function sanitizeState(raw: Record<string, unknown>): SyncState {
+  const state: SyncState = {
+    consecutiveFailures: typeof raw.consecutiveFailures === 'number' && Number.isFinite(raw.consecutiveFailures)
+      ? raw.consecutiveFailures : 0,
+  };
+  if (isValidIsoDate(raw.lastAttemptAt)) state.lastAttemptAt = raw.lastAttemptAt;
+  if (isValidIsoDate(raw.lastSuccessAt)) state.lastSuccessAt = raw.lastSuccessAt;
+  if (isValidIsoDate(raw.nextRetryAt)) state.nextRetryAt = raw.nextRetryAt;
+  if (typeof raw.lastError === 'string') state.lastError = raw.lastError;
+  return state;
+}
+
 export function readSyncState(): SyncState {
   const file = syncStatePath();
   if (!fs.existsSync(file)) return defaultState();
   try {
-    const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as Record<string, unknown>;
-    if (raw && typeof raw === 'object' && !Array.isArray(raw)) return { ...defaultState(), ...raw } as SyncState;
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as unknown;
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) return sanitizeState(raw as Record<string, unknown>);
   } catch {
     // 损坏时按初始状态处理
   }
@@ -60,21 +77,39 @@ function recordFailure(now: () => number, error: string | undefined): void {
   });
 }
 
+/** 尚未定义时的哨兵：区分"还没有上一批"与"上一批首元素恰好是 undefined（缺 event_id 的脏数据）" */
+const NO_PREV_BATCH = Symbol('no-prev-batch');
+
+function readFirstUnreportedId(): unknown {
+  return readUnreported(1)[0]?.event_id;
+}
+
 /** 反复补发直到队列清空或失败；reporter 为 noop 时不消费队列（控制器裁定，未配置上报期间事件全部保留在本地） */
-export async function syncAll(reporter: Reporter, now: () => number = Date.now): Promise<{ sent: number; remaining: number; error?: string }> {
-  if (reporter.name === 'noop') return { sent: 0, remaining: countUnreported() };
+export async function syncAll(
+  reporter: Reporter,
+  now: () => number = Date.now,
+): Promise<{ sent: number; remaining: number; failed: boolean; error?: string }> {
+  if (reporter.name === 'noop') return { sent: 0, remaining: countUnreported(), failed: false };
   let sent = 0;
+  let prevFirstId: unknown = NO_PREV_BATCH;
   for (;;) {
+    const first = readFirstUnreportedId();
+    if (prevFirstId !== NO_PREV_BATCH && first === prevFirstId) {
+      // 连续两批的队首都是同一条（通常是缺合法 event_id、永远无法被标记已上报的脏数据），
+      // 不会再有进展，停止循环，避免死循环（控制器裁定）
+      break;
+    }
+    prevFirstId = first;
     const result = await flushEvents(reporter, 50);
     sent += result.sent;
     if (result.failed) {
       recordFailure(now, result.error);
-      return { sent, remaining: countUnreported(), error: result.error };
+      return { sent, remaining: countUnreported(), failed: true, error: result.error };
     }
     if (result.sent === 0) break;
   }
   recordSuccess(now);
-  return { sent, remaining: countUnreported() };
+  return { sent, remaining: countUnreported(), failed: false };
 }
 
 /** commit 后自动补发一批；命中退避窗口时直接跳过；reporter 为 noop 时不消费队列 */
@@ -109,7 +144,7 @@ export function describeStatus(config: AicodeConfig): string {
     `最近尝试时间：${state.lastAttemptAt ?? '(无)'}`,
     `最近成功时间：${state.lastSuccessAt ?? '(无)'}`,
   ];
-  if (state.lastError) lines.push(`最近错误：${state.lastError}`);
+  if (state.consecutiveFailures > 0) lines.push(`最近错误：${state.lastError ?? '(未知错误)'}`);
   lines.push(`下次自动补发时间：${state.nextRetryAt ?? '(无退避，随时可补发)'}`);
   return lines.join('\n');
 }

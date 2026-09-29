@@ -170,6 +170,46 @@ describe('端到端', () => {
     expect(r.stdout).toContain('失败原因');
   });
 
+  it('aicode sync：reporter 抛出消息为空的错误（如 AggregateError）时仍退出 1 并打印失败原因；status 也显示最近错误', async () => {
+    expect(run(['init', '--yes']).status).toBe(0);
+    const modFile = path.join(home, 'aggregate-failing-reporter.mjs');
+    fs.writeFileSync(
+      modFile,
+      "export default () => ({ name: 'file', async report() { throw new AggregateError([new Error('inner')]); } });\n",
+    );
+    const configFile = path.join(home, '.aicode', 'config.json');
+    const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    config.reporter = { type: 'module', module: modFile };
+    fs.writeFileSync(configFile, JSON.stringify(config));
+
+    const repo = initRepo();
+    sh(repo, ['remote', 'add', 'origin', 'git@gitlab.example.com:group/aggregate-fail.git']);
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+    const sha = commitAll(repo, 'feat: aggregate fail');
+    await waitForEvent(sha);
+
+    const r = run(['sync']);
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain('失败原因');
+
+    const s = run(['status']);
+    expect(s.status).toBe(0);
+    expect(s.stdout).toContain('最近错误');
+  });
+
+  it('aicode sync：配置的 reporter 加载失败回退到 noop 时，提示配置无效并退出 1（而不是当成未配置）', () => {
+    expect(run(['init', '--yes']).status).toBe(0);
+    const configFile = path.join(home, '.aicode', 'config.json');
+    const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    config.reporter = { type: 'module' }; // 缺少 module 字段，loadReporter 会回退到 noop
+    fs.writeFileSync(configFile, JSON.stringify(config));
+
+    const r = run(['sync']);
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain('上报配置无效');
+    expect(r.stdout).toContain('type=module');
+  });
+
   it('aicode track / untrack / track --list', () => {
     run(['init', '--yes']);
     const repo = initRepo();
