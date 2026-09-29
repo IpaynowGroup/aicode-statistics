@@ -6,6 +6,7 @@ import { fingerprintText } from '../src/fingerprint.js';
 import { repoId, repoKey } from '../src/git.js';
 import { appendRecords, readRecords, type LedgerRecord } from '../src/ledger.js';
 import { eventsPath } from '../src/paths.js';
+import { trackRepo } from '../src/track.js';
 import { commitAll, initRepo, sh, tmpHome } from './helpers.js';
 
 beforeEach(() => tmpHome());
@@ -90,5 +91,18 @@ describe('runCommit', () => {
 
   it('不在 git 仓库时返回 null', async () => {
     expect(await runCommit(process.env.HOME!)).toBeNull();
+  });
+
+  it('list 模式下名单外仓库返回 null 且不写 events', async () => {
+    const other = initRepo();
+    sh(other, ['remote', 'add', 'origin', 'git@gitlab.example.com:group/other.git']);
+    const trackedRepo = initRepo();
+    sh(trackedRepo, ['remote', 'add', 'origin', 'git@gitlab.example.com:group/tracked.git']);
+    trackRepo(trackedRepo); // 切到 list 模式，other 不在名单中
+
+    fs.writeFileSync(path.join(other, 'a.txt'), 'a\n');
+    commitAll(other, 'init');
+    expect(await runCommit(other)).toBeNull();
+    expect(fs.existsSync(eventsPath())).toBe(false);
   });
 });

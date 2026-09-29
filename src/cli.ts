@@ -1,15 +1,19 @@
 #!/usr/bin/env node
 import readline from 'node:readline';
 import { runCommit } from './commit.js';
+import { repoRoot } from './git.js';
 import { runHook } from './hook.js';
 import { planGlobal, planProject } from './init.js';
 import { logError } from './log.js';
+import { describeTrack, setTrackAll, trackRepo, untrackRepo } from './track.js';
 
 const USAGE = [
   '用法:',
   '  aicode init [--local] [--uninstall] [--yes]     安装 / 卸载钩子（--local 仅作用于当前仓库）',
   '  aicode hook <pre|post> --tool <claude|codex>    由 AI 工具钩子调用',
   '  aicode commit                                   由 post-commit 调用',
+  '  aicode track [--all|--list]                     把当前仓库加入统计名单 / 恢复统计所有仓库 / 查看名单',
+  '  aicode untrack                                  把当前仓库移出统计名单',
 ].join('\n');
 
 /** 解析 `--name value` 形式的参数；未传或值为空字符串时视为缺省 */
@@ -65,6 +69,51 @@ async function init(flags: string[]): Promise<number> {
   return 0;
 }
 
+function track(flags: string[]): number {
+  const allowedFlags = new Set(['--all', '--list']);
+  for (const flag of flags) {
+    if (!allowedFlags.has(flag)) {
+      console.error(`未知参数: ${flag}`);
+      console.error(USAGE);
+      return 1;
+    }
+  }
+  if (flags.includes('--list')) {
+    console.log(describeTrack());
+    return 0;
+  }
+  if (flags.includes('--all')) {
+    setTrackAll();
+    console.log('已恢复统计所有仓库');
+    return 0;
+  }
+  const root = repoRoot(process.cwd());
+  if (!root) {
+    console.error('当前目录不在 git 仓库中');
+    return 1;
+  }
+  const { id, switched } = trackRepo(root);
+  console.log(`已加入统计名单：${id}`);
+  if (switched) console.log('现在只统计名单中的仓库（aicode track --all 可恢复统计全部）');
+  return 0;
+}
+
+function untrack(flags: string[]): number {
+  if (flags.length) {
+    console.error(`未知参数: ${flags[0]}`);
+    console.error(USAGE);
+    return 1;
+  }
+  const root = repoRoot(process.cwd());
+  if (!root) {
+    console.error('当前目录不在 git 仓库中');
+    return 1;
+  }
+  const { id, removed } = untrackRepo(root);
+  console.log(removed ? `已移出统计名单：${id}` : '该仓库不在名单中');
+  return 0;
+}
+
 async function main(args: string[]): Promise<number> {
   const [cmd, ...rest] = args;
   if (cmd === 'init') {
@@ -72,6 +121,22 @@ async function main(args: string[]): Promise<number> {
       return await init(rest);
     } catch (err) {
       console.error(`aicode init 失败: ${err instanceof Error ? err.message : String(err)}`);
+      return 1;
+    }
+  }
+  if (cmd === 'track') {
+    try {
+      return track(rest);
+    } catch (err) {
+      console.error(`aicode track 失败: ${err instanceof Error ? err.message : String(err)}`);
+      return 1;
+    }
+  }
+  if (cmd === 'untrack') {
+    try {
+      return untrack(rest);
+    } catch (err) {
+      console.error(`aicode untrack 失败: ${err instanceof Error ? err.message : String(err)}`);
       return 1;
     }
   }

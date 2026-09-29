@@ -6,6 +6,7 @@ import { buildIgnore } from './ignore.js';
 import { readRecords, withLock, writeRecords } from './ledger.js';
 import { commitModule, createModuleResolver, resolveOwner } from './metadata.js';
 import { flushEvents, loadReporter } from './reporter/index.js';
+import { isRepoTracked } from './track.js';
 import { VERSION } from './version.js';
 
 export const LEDGER_TTL_SECONDS = 7 * 86400;
@@ -15,6 +16,7 @@ export interface RunCommitOptions { sha?: string; branch?: string; reflog?: stri
 export async function runCommit(cwd: string, opts?: RunCommitOptions): Promise<CommitEvent | null> {
   const root = repoRoot(cwd);
   if (!root) return null;
+  if (!isRepoTracked(root)) return null;
   const info = commitInfo(root, opts?.sha ?? 'HEAD');
   if (info.parents.length > 1) return null; // merge commit 不统计
   const id = repoId(root);

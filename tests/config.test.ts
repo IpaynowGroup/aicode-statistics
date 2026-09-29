@@ -9,7 +9,22 @@ describe('loadConfig', () => {
   beforeEach(() => tmpHome());
 
   it('没有配置文件时返回默认值', () => {
-    expect(loadConfig(null)).toEqual({ owner: undefined, modules: [], ignore: [], reporter: { type: 'noop' } });
+    expect(loadConfig(null)).toEqual({
+      owner: undefined, modules: [], ignore: [], reporter: { type: 'noop' }, track: { mode: 'all', repos: [] },
+    });
+  });
+
+  it('仓库级 .aicode.json 写 track 不生效（只认全局配置）', () => {
+    writeDefaultConfig();
+    const global = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
+    global.track = { mode: 'list', repos: ['gitlab.example.com/group/global'] };
+    fs.writeFileSync(configPath(), JSON.stringify(global));
+    const repo = initRepo();
+    fs.writeFileSync(
+      path.join(repo, '.aicode.json'),
+      JSON.stringify({ track: { mode: 'list', repos: ['gitlab.example.com/group/evil'] } }),
+    );
+    expect(loadConfig(repo).track).toEqual({ mode: 'list', repos: ['gitlab.example.com/group/global'] });
   });
 
   it('仓库配置覆盖 owner/modules/ignore，但不能覆盖 reporter', () => {

@@ -139,4 +139,25 @@ describe('端到端', () => {
     expect(() => execFileSync('git', ['config', '--global', '--get', 'core.hooksPath'], { cwd: home, env: { ...process.env, HOME: home } })).toThrow();
     expect(fs.existsSync(path.join(home, '.claude', 'settings.json'))).toBe(false); // 由 aicode 创建，卸载时删除
   });
+
+  it('aicode track / untrack / track --list', () => {
+    run(['init', '--yes']);
+    const repo = initRepo();
+    sh(repo, ['remote', 'add', 'origin', 'git@gitlab.example.com:group/proj.git']);
+
+    const trackResult = run(['track'], undefined, repo);
+    expect(trackResult.status).toBe(0);
+    expect(trackResult.stdout).toContain('已加入统计名单');
+
+    const listResult = run(['track', '--list'], undefined, repo);
+    expect(listResult.status).toBe(0);
+    expect(listResult.stdout).toContain('gitlab.example.com/group/proj');
+
+    const untrackResult = run(['untrack'], undefined, repo);
+    expect(untrackResult.status).toBe(0);
+    expect(untrackResult.stdout).toContain('已移出统计名单');
+
+    const listAfter = run(['track', '--list'], undefined, repo);
+    expect(listAfter.stdout).not.toContain('gitlab.example.com/group/proj');
+  });
 });

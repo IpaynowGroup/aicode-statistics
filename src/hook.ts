@@ -10,6 +10,7 @@ import {
   captureEditBaseline, captureShellBaseline, cleanupPending, editChanges, hasPending, isDone, savePending, shellChanges,
   takePending, type Baseline, type Change,
 } from './snapshot.js';
+import { isRepoTracked } from './track.js';
 
 export const HOOK_BUDGET_MS = 2000;
 
@@ -41,7 +42,7 @@ function ignoreFor(root: string): IgnoreFn {
 
 function locate(absPath: string): { root: string; rel: string } | null {
   const root = repoRootForPath(absPath);
-  if (!root) return null;
+  if (!root || !isRepoTracked(root)) return null;
   const rel = toRepoRelative(root, absPath);
   if (rel.startsWith('..') || ignoreFor(root)(rel)) return null;
   return { root, rel };
@@ -54,7 +55,7 @@ function editBaseline(input: HookInput): Baseline | null {
 
 function shellBaseline(input: HookInput, deadline: number): Baseline | null {
   const root = repoRoot(input.cwd);
-  return root ? captureShellBaseline(root, ignoreFor(root), deadline) : null;
+  return root && isRepoTracked(root) ? captureShellBaseline(root, ignoreFor(root), deadline) : null;
 }
 
 function editPost(input: HookInput, baseline: Baseline | null): Change[] {

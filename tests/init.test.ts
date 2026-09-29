@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { readGlobalConfig } from '../src/config.js';
+import { repoId } from '../src/git.js';
 import { planGlobal, planProject } from '../src/init.js';
 import { commitAll, initRepo, sh, tmpHome } from './helpers.js';
 
@@ -63,6 +65,21 @@ describe('planProject', () => {
     expect(fs.existsSync(path.join(repo, '.git', 'hooks', 'post-commit'))).toBe(false);
     expect(fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8')).toBe(excludeBefore);
     expect(fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8')).toBe(globalCodex);
+  });
+
+  it('安装后统计名单含该仓库、mode 不变；卸载后名单不含该仓库', () => {
+    const repo = initRepo();
+    sh(repo, ['remote', 'add', 'origin', 'git@gitlab.example.com:group/proj.git']);
+    const id = repoId(repo);
+
+    applyAll(planProject(repo, false));
+    const afterInstall = readGlobalConfig().track as { mode: string; repos: string[] } | undefined;
+    expect(afterInstall?.mode).toBe('all'); // 仅加入名单，不改变统计模式
+    expect(afterInstall?.repos).toContain(id);
+
+    applyAll(planProject(repo, true));
+    const afterUninstall = readGlobalConfig().track as { mode: string; repos: string[] } | undefined;
+    expect(afterUninstall?.repos ?? []).not.toContain(id);
   });
 
   it('已有未跟踪的 settings.local.json 时，安装期间产生的 .aicode.bak 被 exclude 忽略；卸载后不留 .bak（见 F5）', () => {

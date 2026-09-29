@@ -6,7 +6,8 @@ import { repoId, repoKey } from '../src/git.js';
 import { runHook } from '../src/hook.js';
 import { readRecords } from '../src/ledger.js';
 import { pendingDir } from '../src/paths.js';
-import { commitAll, initRepo, tmpHome } from './helpers.js';
+import { trackRepo } from '../src/track.js';
+import { commitAll, initRepo, sh, tmpHome } from './helpers.js';
 
 let home: string;
 beforeEach(() => {
@@ -99,5 +100,30 @@ describe('shell 类工具', () => {
     runHook('pre', 'claude', raw);
     runHook('post', 'claude', raw);
     expect(fs.existsSync(pendingDir())).toBe(false);
+  });
+});
+
+describe('统计名单', () => {
+  it('list 模式下名单外仓库不产生 pending、不写 ledger；名单内仓库照常记录', () => {
+    const trackedRepo = initRepo();
+    sh(trackedRepo, ['remote', 'add', 'origin', 'git@gitlab.example.com:group/tracked.git']);
+    trackRepo(trackedRepo); // 切到 list 模式，仅 trackedRepo 在名单中
+    const untrackedRepo = initRepo();
+    sh(untrackedRepo, ['remote', 'add', 'origin', 'git@gitlab.example.com:group/untracked.git']);
+
+    const fileU = path.join(untrackedRepo, 'a.ts');
+    const rawU = { session_id: 's', tool_use_id: 'u1', cwd: untrackedRepo, tool_name: 'Write', tool_input: { file_path: fileU, content: 'x\n' } };
+    runHook('pre', 'claude', rawU);
+    expect(fs.existsSync(pendingDir())).toBe(false);
+    fs.writeFileSync(fileU, 'x\n');
+    runHook('post', 'claude', rawU);
+    expect(records(untrackedRepo)).toEqual([]);
+
+    const fileT = path.join(trackedRepo, 'a.ts');
+    const rawT = { session_id: 's', tool_use_id: 't1', cwd: trackedRepo, tool_name: 'Write', tool_input: { file_path: fileT, content: 'y\n' } };
+    runHook('pre', 'claude', rawT);
+    fs.writeFileSync(fileT, 'y\n');
+    runHook('post', 'claude', rawT);
+    expect(records(trackedRepo).map((r) => r.f)).toEqual(fingerprintText('y'));
   });
 });

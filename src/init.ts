@@ -10,6 +10,7 @@ import {
   uninstallProjectGitHook,
 } from './installer/git.js';
 import { aicodeHome, claudeSettingsPath, codexHome, configPath, ledgerDir, logPath, pendingDir } from './paths.js';
+import { addToTrackList, removeFromTrackList } from './track.js';
 
 export interface Step { file: string; summary: string; apply: () => void }
 export interface Plan { steps: Step[]; notes: string[] }
@@ -90,6 +91,7 @@ export function planProject(cwd: string, uninstall: boolean): Plan {
       notes.push('post-commit 已被其他工具替换，无法安全恢复 aicode 安装前的 hook，将保留两者，请手动处理 post-commit.aicode-orig');
     }
     steps.push({ file: hookFile, summary: '删除 aicode 的 post-commit，恢复原有 hook', apply: () => uninstallProjectGitHook(root) });
+    steps.push({ file: configPath(), summary: '把当前仓库移出统计名单', apply: () => removeFromTrackList(root) });
     return { steps, notes };
   }
 
@@ -122,6 +124,7 @@ export function planProject(cwd: string, uninstall: boolean): Plan {
     steps.push({ file: excludeFile, summary: `追加忽略条目 ${excludes.join(' ')}，避免出现在 git status 中`, apply: () => addExclude(root, excludes) });
   }
   steps.push({ file: hookFile, summary: '写入 post-commit；已有的 hook 改名为 post-commit.aicode-orig 并在其中被调用', apply: () => installProjectGitHook(root) });
+  steps.push({ file: configPath(), summary: '把当前仓库加入统计名单（名单模式下生效）', apply: () => addToTrackList(root) });
   const local = localHooksPath(root);
   if (local) notes.push(HUSKY_NOTE(local));
   return { steps, notes };
