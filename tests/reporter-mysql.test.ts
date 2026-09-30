@@ -62,6 +62,11 @@ describe('参数解析', () => {
     expect(resolveMysqlOptions(baseOptions).password).toBe('from-env');
     expect(() => resolveMysqlOptions({ host: 'db' })).toThrow('host、user、database');
   });
+
+  it('环境变量为空字符串时视为未设置，回退到配置文件中的密码', () => {
+    process.env.AICODE_MYSQL_PASSWORD = '';
+    expect(resolveMysqlOptions(baseOptions).password).toBe('from-config');
+  });
 });
 
 describe('createMysqlReporter', () => {

@@ -10,11 +10,6 @@ export interface Prompter {
   close?(): void;
 }
 
-/**
- * 基于 readline 的交互式 Prompter：ask 展示默认值、空输入回车沿用默认值；askSecret 不回显输入；
- * historySize:0 关闭输入历史，避免密码可通过方向键（↑）从历史记录中被翻出来；
- * Ctrl+C 时打印换行后以 130（128+SIGINT）退出，不写入任何配置。
- */
 /** readline 在 Ctrl+D（EOF）时关闭输入流而不触发 question 的回调；用该错误标记这种情况，供 runMysqlWizard 识别 */
 export class WizardEofError extends Error {
   constructor() {
@@ -22,6 +17,11 @@ export class WizardEofError extends Error {
   }
 }
 
+/**
+ * 基于 readline 的交互式 Prompter：ask 展示默认值、空输入回车沿用默认值；askSecret 不回显输入；
+ * historySize:0 关闭输入历史，避免密码可通过方向键（↑）从历史记录中被翻出来；
+ * Ctrl+C 时打印换行后以 130（128+SIGINT）退出，不写入任何配置。
+ */
 export function createTtyPrompter(): Prompter {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, historySize: 0 });
   // 有 question 等待回答时非空；rl 在提问期间关闭（Ctrl+D）说明用户想退出，而不是给出了空答案
@@ -226,8 +226,10 @@ export async function runMysqlWizard(prompter: Prompter, probe: MysqlProbe): Pro
   const defaultDatabase = typeof defaults.database === 'string' ? defaults.database : undefined;
   const defaultUser = typeof defaults.user === 'string' ? defaults.user : undefined;
   const existingPassword = typeof defaults.password === 'string' ? defaults.password : undefined;
-  // 与内置 MySQL Reporter（resolveMysqlOptions）同样的优先级：设置了该环境变量时，上报永远用它，配置文件里的密码不生效
-  const envPassword = process.env.AICODE_MYSQL_PASSWORD;
+  // 与内置 MySQL Reporter（resolveMysqlOptions）同样的优先级：设置了该环境变量时，上报永远用它，配置文件里的密码不生效；
+  // 空字符串视为未设置（用户可能只是 export 了一个空变量），否则会用空密码去测试连接、覆盖已保存的密码
+  const rawEnvPassword = process.env.AICODE_MYSQL_PASSWORD;
+  const envPassword = rawEnvPassword && rawEnvPassword.length > 0 ? rawEnvPassword : undefined;
   if (envPassword) console.log('检测到环境变量 AICODE_MYSQL_PASSWORD，上报时将优先使用它');
 
   try {
@@ -298,6 +300,8 @@ export async function runMysqlWizard(prompter: Prompter, probe: MysqlProbe): Pro
  * 返回值区分原状态：mysql / 其他非 noop 类型 / 本就是 noop。
  */
 export function disableMysql(): string {
+  // 与 updateGlobalConfig 用同一严格校验：配置已损坏时先抛错，绝不能落到"当前未启用上报"这类误导性提示上
+  assertGlobalConfigWritable();
   const existing = readGlobalConfig();
   const existingReporter = existing.reporter as ReporterConfig | undefined;
   const type = existingReporter?.type ?? 'noop';

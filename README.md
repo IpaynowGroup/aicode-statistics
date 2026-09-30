@@ -102,7 +102,7 @@ export default (options) => ({
   name: 'gateway',
   async report(event) {
     const res = await fetch(options.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(event) });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`); // 抛错后该事件保留，下次 commit 时补发
+    if (!res.ok) throw new Error(`HTTP ${res.status}`); // 抛错后该事件保留，下次 commit 时按退避重试，或执行 aicode sync 立即补发
   },
 });
 ```

@@ -41,12 +41,14 @@ export function resolveMysqlOptions(options: Record<string, unknown>): MysqlOpti
   if (typeof host !== 'string' || typeof user !== 'string' || typeof database !== 'string') {
     throw new Error('mysql reporter 需要配置 host、user、database');
   }
+  // 空字符串视为未设置，回退到配置文件中的密码
+  const envPassword = process.env.AICODE_MYSQL_PASSWORD;
   return {
     host,
     user,
     database,
     port: typeof port === 'number' ? port : 3306,
-    password: process.env.AICODE_MYSQL_PASSWORD ?? (typeof password === 'string' ? password : undefined),
+    password: envPassword && envPassword.length > 0 ? envPassword : (typeof password === 'string' ? password : undefined),
     connectTimeout: 5000,
   };
 }

@@ -337,6 +337,14 @@ describe('disableMysql', () => {
     expect(disableMysql()).toBe('当前未启用上报');
     expect(fs.readFileSync(configPath(), 'utf8')).toBe(before);
   });
+
+  it('全局配置损坏时抛错，不写入（不能让"关闭上报"静默失败并误导用户）', () => {
+    fs.mkdirSync(path.dirname(configPath()), { recursive: true });
+    const corrupt = '{bad json';
+    fs.writeFileSync(configPath(), corrupt);
+    expect(() => disableMysql()).toThrow('解析失败');
+    expect(fs.readFileSync(configPath(), 'utf8')).toBe(corrupt);
+  });
 });
 
 describe('runMysqlWizard 识别 AICODE_MYSQL_PASSWORD 环境变量', () => {
@@ -374,6 +382,28 @@ describe('runMysqlWizard 识别 AICODE_MYSQL_PASSWORD 环境变量', () => {
     const { probe } = fakeProbe({ grants: ['GRANT ALL PRIVILEGES ON *.* TO `u`@`%`'] });
     const code = await runMysqlWizard(prompter, probe);
     expect(code).toBe(0);
+    const cfg = readGlobalConfig();
+    expect((cfg.reporter as { options: { password?: string } }).options.password).toBe('old-pw');
+  });
+
+  it('环境变量为空字符串时视为未设置：不打印提示、照常询问密码、测试连接用已保存的密码', async () => {
+    updateGlobalConfig((raw) => {
+      raw.reporter = { type: 'mysql', options: { host: 'h', port: 3306, user: 'u', database: 'd', password: 'old-pw' } };
+    });
+    process.env.AICODE_MYSQL_PASSWORD = '';
+    const { prompter, log } = fakePrompter({ ask: ['', '', '', ''], askSecret: [''] });
+    let usedPassword: string | undefined;
+    const { probe } = fakeProbe({ grants: ['GRANT ALL PRIVILEGES ON *.* TO `u`@`%`'] });
+    const wrappedProbe: MysqlProbe = {
+      async connect(opts) {
+        usedPassword = opts.password;
+        return probe.connect(opts);
+      },
+    };
+    const code = await runMysqlWizard(prompter, wrappedProbe);
+    expect(code).toBe(0);
+    expect(log.some((l) => l.startsWith('askSecret'))).toBe(true); // 照常询问了密码
+    expect(usedPassword).toBe('old-pw');
     const cfg = readGlobalConfig();
     expect((cfg.reporter as { options: { password?: string } }).options.password).toBe('old-pw');
   });
