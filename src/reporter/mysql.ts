@@ -30,7 +30,7 @@ export const INSERT_COMMIT_SQL =
 export const INSERT_FILE_SQL =
   'INSERT IGNORE INTO ai_commit_file (repo_key, commit_sha, path_sha1, path, module, added, ai) VALUES (?, ?, ?, ?, ?, ?, ?)';
 export const INSERT_TOOL_SQL =
-  'INSERT IGNORE INTO ai_commit_tool (repo_key, commit_sha, tool, model, ai, generated) VALUES (?, ?, ?, ?, ?, ?)';
+  'INSERT IGNORE INTO ai_commit_tool (repo_key, commit_sha, tool, model, ai, `generated`) VALUES (?, ?, ?, ?, ?, ?)';
 
 export function toMysqlDatetime(iso: string): string {
   return new Date(iso).toISOString().slice(0, 19).replace('T', ' ');

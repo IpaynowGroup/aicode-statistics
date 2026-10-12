@@ -1,130 +1,381 @@
-# aicode
+# aicode-stats
 
-统计 Claude Code、Codex 等 AI 编码工具在每个 git commit 中的**有效代码量**：只有 AI 写入且最终被提交的行才计为 AI 行，被人工改过的行计为人工行。统计结果汇总在本机 `~/.aicode/events.jsonl`，并通过可扩展的 Reporter 上报（默认不上报）。
+> 统计 Claude Code / Codex 等 AI 编码工具的有效代码量，自动采集 AI 生成代码的统计信息并上报到 MySQL 数据库
 
-## 安装
+## ✨ 特性
+
+- 🤖 **支持多种 AI 工具**：Claude Code、Codex 等
+- 📊 **详细统计**：AI 生成行数、人工修改行数、采纳率
+- 🗄️ **MySQL 存储**：结构化存储，便于查询分析
+- 🎯 **模块化统计**：按代码模块分类统计
+- 🚫 **智能过滤**：自动忽略 lock 文件、生成代码
+- 🔒 **安全设计**：密码支持环境变量，配置文件权限 600
+
+## 📦 安装
 
 ```bash
-npm install -g .                 # 在本仓库目录执行（需先 npm run build）
+npm install -g aicode-stats
+```
 
-# 全局模式：覆盖本机所有仓库（改动 ~/.claude/settings.json、~/.codex/config.toml、全局 core.hooksPath）
+## 🚀 快速开始
+
+### 1. 初始化配置
+
+```bash
 aicode init
-aicode init --uninstall
-
-# 项目模式：只作用于当前仓库（改动 .claude/settings.local.json、.codex/config.toml、.git/hooks/post-commit）
-cd your-repo && aicode init --local
-aicode init --local --uninstall
 ```
 
-`init` 会先列出将要改动的文件并请求确认，加 `--yes` 可跳过确认。已存在的文件会先备份为 `*.aicode.bak`。项目模式写入的配置文件会加入 `.git/info/exclude`，不会出现在 `git status` 中；如果这些文件已被仓库跟踪，则不会修改。两种模式可以同时安装，不会重复计数。
+会在 `~/.aicode/` 目录创建配置文件。
 
-## 统计名单：`aicode track` / `untrack`
-
-`aicode init` 是全局安装（覆盖本机所有仓库）；统计名单决定全局安装下**具体统计哪些仓库**，名单只存在全局配置 `~/.aicode/config.json` 的 `track` 字段中：
+### 2. 配置 MySQL 连接
 
 ```bash
-cd your-repo && aicode track        # 把当前仓库加入名单，并把统计模式切到"仅名单"
-aicode untrack                      # 把当前仓库移出名单（不改变统计模式）
-aicode track --all                  # 恢复统计所有仓库（清除"仅名单"限制，名单本身不清空）
-aicode track --list                 # 查看当前统计模式与名单
+aicode config mysql
 ```
 
-- 首次执行 `aicode track` 会把统计模式从"全部仓库"切到"仅名单"，之后未加入名单的仓库不再被统计（钩子直接跳过、不记录基线，commit 时也不生成事件）。
-- `aicode init --local` 安装到某仓库时，会自动把该仓库加入名单（仅在名单模式下才生效，不会主动切换模式）；`--local --uninstall` 卸载时会把它移出名单。
-- `track` / `untrack` / `track --list` 都只读写全局配置，与是否用了 `--local` 无关。
+按提示输入：
+- MySQL 服务器地址
+- 端口（默认 3306）
+- 数据库名
+- 用户名
+- 密码（可选，推荐用环境变量）
 
-## `aicode sync`：手动补发本地积压事件
+### 3. 创建数据库表
 
-未配置上报（reporter 为默认的 noop）或数据库暂时不可达时，采集到的事件会保留在本地队列（`~/.aicode/events.jsonl`）。配置好上报后，执行：
+在 MySQL 中执行建表 SQL：
+
+```sql
+-- 查看建表 SQL
+cat node_modules/aicode-stats/sql/schema.sql
+
+-- 或下载后执行
+mysql -h host -u user -p database < node_modules/aicode-stats/sql/schema.sql
+```
+
+需要创建三张表：
+- `ai_commit` - 提交统计主表
+- `ai_commit_file` - 文件级统计
+- `ai_commit_tool` - 工具/模型级统计
+
+### 4. 安装 Git 钩子
 
 ```bash
+# 全局模式（推荐）- 所有仓库生效
+aicode init --global
+
+# 项目模式 - 仅当前仓库
+cd /path/to/your-repo
+aicode init
+```
+
+### 5. 验证安装
+
+```bash
+# 查看状态
+aicode status
+
+# 测试同步
 aicode sync
 ```
 
-会立即尝试把队列中的事件全部发送出去，并打印已上报/剩余条数；失败时打印失败原因并以非 0 退出。
+## 📖 使用说明
 
-## `aicode status`：查看统计模式、reporter 与同步状态
+### 基本命令
+
+```bash
+# 查看当前状态
+aicode status
+
+# 手动同步数据
+aicode sync
+
+# 重新配置 MySQL
+aicode config mysql
+
+# 管理统计名单
+aicode track          # 加入当前仓库
+aicode untrack        # 移出当前仓库
+aicode track --list   # 查看名单
+aicode track --all    # 统计所有仓库
+```
+
+### 配置文件
+
+配置文件位于 `~/.aicode/config.json`：
+
+```json
+{
+  "owner": {
+    "name": "你的姓名",
+    "email": "your.email@example.com"
+  },
+  "modules": [
+    { "path": "src/user/**", "name": "user-center" },
+    { "path": "src/order/**", "name": "order" }
+  ],
+  "ignore": [
+    "docs/generated/**",
+    "**/*.test.ts"
+  ],
+  "reporter": {
+    "type": "mysql",
+    "options": {
+      "host": "localhost",
+      "port": 3306,
+      "database": "ai_stats",
+      "user": "aicode_writer"
+    }
+  },
+  "track": {
+    "mode": "all",
+    "repos": []
+  }
+}
+```
+
+### 环境变量
+
+```bash
+# 设置 MySQL 密码（推荐）
+export AICODE_MYSQL_PASSWORD="your-password"
+```
+
+### 项目级配置
+
+在仓库根目录创建 `.aicode.json` 可覆盖部分配置：
+
+```json
+{
+  "modules": [
+    { "path": "frontend/**", "name": "frontend" },
+    { "path": "backend/**", "name": "backend" }
+  ],
+  "ignore": [
+    "tests/fixtures/**"
+  ]
+}
+```
+
+## 📊 数据查询示例
+
+### 按开发者统计
+
+```sql
+SELECT 
+  owner_name,
+  COUNT(*) as commits,
+  SUM(added_ai) as ai_lines,
+  AVG(ai_ratio) as avg_ratio
+FROM ai_commit
+GROUP BY owner_name
+ORDER BY ai_lines DESC;
+```
+
+### 按模块统计
+
+```sql
+SELECT 
+  module,
+  SUM(added_total) as total_lines,
+  SUM(added_ai) as ai_lines,
+  AVG(ai_ratio) as avg_ratio
+FROM ai_commit
+GROUP BY module
+ORDER BY ai_lines DESC;
+```
+
+### 按工具/模型统计
+
+```sql
+SELECT 
+  tool,
+  model,
+  SUM(ai) as total_ai_lines,
+  SUM(`generated`) as total_generated,
+  ROUND(SUM(ai) / SUM(`generated`), 3) as accept_rate
+FROM ai_commit_tool
+GROUP BY tool, model
+ORDER BY total_ai_lines DESC;
+```
+
+### 时间趋势（最近 30 天）
+
+```sql
+SELECT 
+  DATE(committed_at) as date,
+  COUNT(*) as commits,
+  SUM(added_ai) as ai_lines,
+  AVG(ai_ratio) as avg_ratio
+FROM ai_commit
+WHERE committed_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+GROUP BY DATE(committed_at)
+ORDER BY date;
+```
+
+## 🔧 高级配置
+
+### 模块映射
+
+通过 glob 模式将文件映射到模块：
+
+```json
+{
+  "modules": [
+    { "path": "src/user/**", "name": "user-center" },
+    { "path": "src/order/**", "name": "order" },
+    { "path": "src/payment/**", "name": "payment" },
+    { "path": "src/common/**", "name": "common" }
+  ]
+}
+```
+
+### 忽略文件
+
+自定义忽略规则（除了内置规则）：
+
+```json
+{
+  "ignore": [
+    "docs/generated/**",
+    "**/*.test.ts",
+    "**/*.spec.ts",
+    "**/coverage/**"
+  ]
+}
+```
+
+### 只统计特定仓库
+
+```json
+{
+  "track": {
+    "mode": "list",
+    "repos": [
+      "gitlab.example.com/team/project1",
+      "gitlab.example.com/team/project2"
+    ]
+  }
+}
+```
+
+## 🛠️ 卸载
+
+```bash
+# 全局卸载
+aicode uninstall --global
+
+# 项目卸载
+cd /path/to/repo
+aicode uninstall
+
+# 完全清理（包括配置文件）
+rm -rf ~/.aicode
+```
+
+## 📚 文档
+
+完整文档请查看：
+
+- [团队安装配置手册](./docs/团队安装配置手册.md)
+- [快速入门](./docs/快速入门.md)
+- [配置文件示例](./docs/配置文件示例.md)
+
+## 🤝 兼容性
+
+### AI 工具
+
+- ✅ Claude Code（官方 CLI）
+- ✅ Codex（Anthropic）
+- ✅ 其他标准 diff 格式工具
+
+### 环境要求
+
+- Node.js >= 18
+- Git >= 2.0
+- MySQL >= 5.7 或 MariaDB >= 10.2
+
+### 操作系统
+
+- ✅ macOS
+- ✅ Linux
+- ✅ Windows（需要 Git Bash 或 WSL）
+
+## ❓ 常见问题
+
+### Q1: GUI Git 客户端（如 Sourcetree）无法统计？
+
+需要在配置文件中写入密码：
+
+```json
+{
+  "reporter": {
+    "options": {
+      "password": "your-password"
+    }
+  }
+}
+```
+
+或者在 GUI 客户端的环境变量中设置 `AICODE_MYSQL_PASSWORD`。
+
+### Q2: 如何查看本地积压的数据？
 
 ```bash
 aicode status
 ```
 
-输出当前统计模式（全部 / 仅名单及名单内容）、reporter 配置（不含密码）、本地积压事件数、最近一次补发尝试/成功时间，以及（如果处于失败退避中）下次自动补发时间。
+会显示本地队列中的事件数量。
 
-## `aicode config mysql`：交互式配置 MySQL 上报
+### Q3: 同步失败怎么办？
 
 ```bash
-aicode config mysql            # 交互式配置向导：依次询问 host/port/database/user/密码，测试连接后保存
-aicode config mysql --disable  # 关闭 MySQL 上报（reporter 改回 noop）
+# 查看详细错误
+aicode sync
+
+# 检查配置
+cat ~/.aicode/config.json
+
+# 测试 MySQL 连接
+mysql -h <host> -P <port> -u <user> -p<password> <database>
 ```
 
-- 密码输入不回显、不进入终端输入历史。
-- 向导会先尝试连接并执行 `SHOW GRANTS FOR CURRENT_USER()`，确认账号具备写入所需的 INSERT 权限；测试失败时会询问是否仍然保存。
-- 配置保存到 `~/.aicode/config.json`（文件权限 600），保留其他既有字段（如 `owner`、`modules`）。
-- 若设置了环境变量 `AICODE_MYSQL_PASSWORD`，向导会提示"上报时将优先使用它"并跳过密码询问，用它来做连接测试；该值不会被写入配置文件（与内置 MySQL Reporter 读取密码的优先级一致）。
+### Q4: 如何暂时停止统计？
 
-## 配置 `~/.aicode/config.json`
+```bash
+# 方法1: 移出名单（需要先切换到名单模式）
+aicode untrack
 
-```json
-{
-  "owner": { "name": "张三", "email": "zhangsan@example.com" },
-  "modules": [{ "path": "src/user/**", "name": "user-center" }],
-  "ignore": ["docs/generated/**"],
-  "reporter": { "type": "module", "module": "/abs/path/my-reporter.mjs", "options": { "url": "https://gw/api" } }
-}
+# 方法2: 临时禁用钩子
+git commit --no-verify -m "message"
+
+# 方法3: 卸载钩子
+aicode uninstall
 ```
 
-仓库根目录的 `.aicode.json` 可以覆盖 `owner`、`modules`、`ignore`；`reporter` 只从全局配置读取。
+### Q5: 数据库权限最小化配置？
 
-## 上报到 MySQL（5.6 及以上）
+创建专用账号，仅授予 INSERT 权限：
 
-1. 由 DBA 执行 `sql/schema.sql` 建表，并创建一个**只有 INSERT 权限**的账号（脚本开头有示例）
-2. 在 `~/.aicode/config.json` 中配置：
-
-```json
-{
-  "reporter": {
-    "type": "mysql",
-    "options": { "host": "db.example.com", "port": 3306, "user": "aicode_writer", "database": "ai_stats" }
-  }
-}
+```sql
+CREATE USER 'aicode_writer'@'%' IDENTIFIED BY 'password';
+GRANT INSERT ON ai_stats.ai_commit TO 'aicode_writer'@'%';
+GRANT INSERT ON ai_stats.ai_commit_file TO 'aicode_writer'@'%';
+GRANT INSERT ON ai_stats.ai_commit_tool TO 'aicode_writer'@'%';
+FLUSH PRIVILEGES;
 ```
 
-3. 密码优先从环境变量 `AICODE_MYSQL_PASSWORD` 读取，也可以写在 `options.password` 中（`init` 已把配置文件权限设为 600）。注意：commit 统计由 git hook 在后台触发，从 GUI git 客户端提交时可能读不到 shell 中设置的环境变量；这种情况下请把密码写进配置文件
+## 📄 许可证
 
-数据库不可达时，事件保留在本地队列，可随时执行 `aicode sync` 手动补发；commit 时也会自动尝试补发一批（每次最多 50 条），失败后按 1→2→4→…→30 分钟递增退避，退避期内的 commit 不会重复尝试，不会阻塞 git。
+MIT License - 详见 [LICENSE](./LICENSE) 文件
 
-## 自定义 Reporter
+## 🙏 致谢
 
-```js
-// my-reporter.mjs
-export default (options) => ({
-  name: 'gateway',
-  async report(event) {
-    const res = await fetch(options.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(event) });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`); // 抛错后该事件保留，下次 commit 时按退避重试，或执行 aicode sync 立即补发
-  },
-});
-```
+本项目基于 Anthropic 的 Claude Code 和 Codex 工具链开发。
 
-**Reporter 必须按 `event_id` 幂等**：在极少数情况下（例如上报成功后写"已上报"标记时磁盘出错），同一事件可能被再次上报，接收方需按 `event_id` 去重（内置 MySQL Reporter 通过主键 + `INSERT IGNORE` 保证）。
+## 🐛 问题反馈
 
-## 数据文件
+如有问题或建议，请提交 [Issue](https://github.com/IpaynowGroup/aicode-statistics/issues)。
 
-| 路径 | 内容 |
-|---|---|
-| `~/.aicode/events.jsonl` | 每个 commit 一条统计事件 |
-| `~/.aicode/ledger/*.jsonl` | 待匹配的 AI 行指纹（不含代码原文） |
-| `~/.aicode/logs/aicode.log` | 错误日志 |
-| `~/.aicode/sync-state.json` | 补发同步状态（最近尝试/成功时间、连续失败次数、下次重试时间） |
+---
 
-## 已知限制
-
-- 仓库级设置了 `core.hooksPath` 的仓库（如 husky v5+）不会触发统计
-- 项目模式下，Codex 只会加载已信任项目的 `.codex/config.toml`；未信任的项目只统计 Claude Code
-- 项目模式安装 Codex 时，Codex 只认全局配置中的信任记录，因此会在 `~/.codex/config.toml` 追加该项目的信任区块（卸载时删除）
-- 自动补发只在 commit 时触发（受退避控制），也可随时执行 aicode sync
-- AI 执行 shell 命令期间，人工对同一仓库的改动会被计为 AI 改动
-- rebase / squash / cherry-pick 后不迁移归属；amend 会生成一条 `amend: true` 的新事件
-- 全局模式设置了 `core.hooksPath` 后，`pre-commit`（Python 框架）会拒绝执行 `pre-commit install`；需要先 `aicode init --uninstall` 或手动处理
-- 钩子脚本里写死了安装时的 node 绝对路径；升级或切换 node（如用 nvm）后，需要重新执行一次 `aicode init` 才能生效
+**Happy Coding with AI! 🚀**

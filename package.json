@@ -1,21 +1,47 @@
 {
   "name": "aicode-stats",
   "version": "0.1.0",
-  "description": "统计 Claude Code / Codex 等 AI 编码工具的有效代码量",
+  "description": "统计 Claude Code / Codex 等 AI 编码工具的有效代码量，自动采集 AI 生成代码的统计信息并上报到 MySQL 数据库",
   "type": "module",
   "bin": {
     "aicode": "dist/cli.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "sql",
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=18"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "tsc -p tsconfig.json && vitest run"
+    "test": "tsc -p tsconfig.json && vitest run",
+    "prepublishOnly": "npm run build && npm test"
   },
+  "keywords": [
+    "ai",
+    "claude",
+    "codex",
+    "statistics",
+    "git",
+    "commit",
+    "analytics",
+    "mysql",
+    "coding-assistant",
+    "ai-tools"
+  ],
+  "author": "IpaynowGroup <jishuzhichi@ipaynow.cn>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/IpaynowGroup/aicode-statistics.git"
+  },
+  "bugs": {
+    "url": "https://github.com/IpaynowGroup/aicode-statistics/issues"
+  },
+  "homepage": "https://github.com/IpaynowGroup/aicode-statistics#readme",
   "devDependencies": {
     "@types/node": "^20.11.0",
     "typescript": "^5.6.0",
