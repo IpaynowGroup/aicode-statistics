@@ -284,9 +284,9 @@ rm -rf ~/.aicode
 
 ### AI 工具
 
-- ✅ Claude Code
-- ✅ Codex
-- ✅ 其他标准 diff 格式工具
+- ✅ Claude Code（Anthropic 官方 CLI）
+- ✅ Codex（AI 编程助手）
+- ✅ 其他支持标准 diff 格式的 AI 工具
 
 ### 环境要求
 

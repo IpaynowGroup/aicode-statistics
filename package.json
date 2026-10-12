@@ -9,6 +9,10 @@
   "files": [
     "dist",
     "sql",
+    "docs/团队安装配置手册.md",
+    "docs/快速入门.md",
+    "docs/配置文件示例.md",
+    "examples",
     "README.md",
     "LICENSE"
   ],
