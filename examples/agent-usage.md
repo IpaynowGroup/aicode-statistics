@@ -9,8 +9,8 @@
 
 ### 方式 B：使用专用 Agent
 ```
-使用 aicode-stats agent 同步数据
-使用 aicode-analyzer agent 分析最近一周的代码统计
+使用 ipaynow-aicode-stats agent 同步数据
+使用 ipaynow-aicode-analyzer agent 分析最近一周的代码统计
 ```
 
 ## 2. 在自定义 Agent 配置中使用
@@ -44,7 +44,7 @@ aicode sync
 import { Agent } from '@anthropic-ai/sdk';
 
 const agent = new Agent({
-  name: 'aicode-stats',
+  name: 'ipaynow-aicode-stats',
   prompt: '执行 aicode status 并报告结果'
 });
 
@@ -72,7 +72,7 @@ jobs:
         with:
           node-version: '18'
       - name: Install aicode
-        run: npm install -g aicode-stats
+        run: npm install -g ipaynow-aicode-stats
       - name: Sync stats
         env:
           AICODE_MYSQL_PASSWORD: ${{ secrets.AICODE_MYSQL_PASSWORD }}

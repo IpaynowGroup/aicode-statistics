@@ -71,10 +71,10 @@ git push --tags
 
 ```bash
 # 查看 npm 包信息
-npm view aicode-stats
+npm view ipaynow-aicode-stats
 
 # 或访问
-# https://www.npmjs.com/package/aicode-stats
+# https://www.npmjs.com/package/ipaynow-aicode-stats
 ```
 
 ## 🔒 安全说明
@@ -86,9 +86,11 @@ npm view aicode-stats
 
 ## ⚠️ 注意事项
 
-### 包名冲突
+### 包名说明
 
-如果 `aicode-stats` 已被占用，需要修改 `package.json`：
+本项目使用 `ipaynow-aicode-stats` 作为包名，避免与现有包名冲突。
+
+如需使用组织作用域，可修改 `package.json`：
 
 ```json
 {

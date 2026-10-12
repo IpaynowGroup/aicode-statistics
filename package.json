@@ -1,5 +1,5 @@
 {
-  "name": "aicode-stats",
+  "name": "ipaynow-aicode-stats",
   "version": "0.1.0",
   "description": "统计 Claude Code / Codex 等 AI 编码工具的有效代码量，自动采集 AI 生成代码的统计信息并上报到 MySQL 数据库",
   "type": "module",

@@ -1,4 +1,4 @@
-# aicode-stats
+# ipaynow-aicode-stats
 
 > 统计 Claude Code / Codex 等 AI 编码工具的有效代码量，自动采集 AI 生成代码的统计信息并上报到 MySQL 数据库
 
@@ -14,7 +14,7 @@
 ## 📦 安装
 
 ```bash
-npm install -g aicode-stats
+npm install -g ipaynow-aicode-stats
 ```
 
 ## 🚀 快速开始
@@ -46,10 +46,10 @@ aicode config mysql
 
 ```sql
 -- 查看建表 SQL
-cat node_modules/aicode-stats/sql/schema.sql
+cat node_modules/ipaynow-aicode-stats/sql/schema.sql
 
 -- 或下载后执行
-mysql -h host -u user -p database < node_modules/aicode-stats/sql/schema.sql
+mysql -h host -u user -p database < node_modules/ipaynow-aicode-stats/sql/schema.sql
 ```
 
 需要创建三张表：
