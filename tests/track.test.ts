@@ -92,50 +92,60 @@ function repoWithOrigin(url: string): string {
 }
 
 describe('trackRepo / isRepoTracked / untrackRepo', () => {
-  it('trackRepo 从 all 切到 list，switched 为 true；再次 track 同一仓库不重复、switched 为 false', () => {
+  it('trackRepo 在 all 模式下从黑名单移除，switched 永远为 false', () => {
     const repo = repoWithOrigin('git@gitlab.example.com:group/a.git');
-    const first = trackRepo(repo);
-    expect(first.switched).toBe(true);
-    expect(readGlobalConfig().track).toEqual({ mode: 'list', repos: [first.id] });
+    // 先加入黑名单
+    untrackRepo(repo);
+    expect(readGlobalConfig().track).toEqual({ mode: 'all', repos: [repoId(repo)] });
 
+    // track 从黑名单移除
+    const first = trackRepo(repo);
+    expect(first.switched).toBe(false);
+    expect(readGlobalConfig().track).toEqual({ mode: 'all', repos: [] });
+
+    // 再次 track 已经不在黑名单的仓库，repos 保持为空
     const second = trackRepo(repo);
     expect(second.switched).toBe(false);
-    expect(readGlobalConfig().track).toEqual({ mode: 'list', repos: [first.id] });
+    expect(readGlobalConfig().track).toEqual({ mode: 'all', repos: [] });
   });
 
-  it('isRepoTracked：all 模式下任意仓库为 true；list 模式下名单内为 true、名单外为 false', () => {
+  it('isRepoTracked：all 模式下，黑名单外为 true、黑名单内为 false', () => {
     const tracked = repoWithOrigin('git@gitlab.example.com:group/tracked.git');
     const other = repoWithOrigin('git@gitlab.example.com:group/other.git');
+    // 默认 all 模式，repos 为空，所有仓库都跟踪
     expect(isRepoTracked(tracked)).toBe(true);
     expect(isRepoTracked(other)).toBe(true);
 
-    trackRepo(tracked);
-    expect(isRepoTracked(tracked)).toBe(true);
-    expect(isRepoTracked(other)).toBe(false);
+    // untrack 添加到黑名单
+    untrackRepo(tracked);
+    expect(isRepoTracked(tracked)).toBe(false);
+    expect(isRepoTracked(other)).toBe(true);
   });
 
-  it('untrackRepo 移出名单；setTrackAll 后名单外仓库也为 true', () => {
+  it('untrackRepo 添加到黑名单；setTrackAll 清空黑名单后所有仓库都为 true', () => {
     const tracked = repoWithOrigin('git@gitlab.example.com:group/tracked.git');
     const other = repoWithOrigin('git@gitlab.example.com:group/other.git');
-    trackRepo(tracked);
-    expect(isRepoTracked(other)).toBe(false);
 
+    // untrack 添加到黑名单
     const result = untrackRepo(tracked);
     expect(result.removed).toBe(true);
     expect(isRepoTracked(tracked)).toBe(false);
+    expect(isRepoTracked(other)).toBe(true);
 
+    // 再次 untrack 已在黑名单的仓库
     const again = untrackRepo(tracked);
     expect(again.removed).toBe(false);
 
+    // setTrackAll 清空黑名单
     setTrackAll();
-    expect(isRepoTracked(other)).toBe(true);
     expect(isRepoTracked(tracked)).toBe(true);
+    expect(isRepoTracked(other)).toBe(true);
   });
 
-  it('describeTrack 描述当前模式与名单', () => {
+  it('describeTrack 描述当前模式与黑名单', () => {
     expect(describeTrack()).toContain('所有仓库');
     const repo = repoWithOrigin('git@gitlab.example.com:group/described.git');
-    const { id } = trackRepo(repo);
+    const { id } = untrackRepo(repo); // untrack 添加到黑名单
     expect(describeTrack()).toContain(id);
   });
 
@@ -148,23 +158,32 @@ describe('trackRepo / isRepoTracked / untrackRepo', () => {
     expect(fs.readFileSync(configPath(), 'utf8')).toBe(corrupt);
   });
 
-  it('removeFromTrackList：仓库不在名单中时不写入，不创建 ~/.aicode/config.json（对应 init --local --uninstall 场景）', () => {
-    const repo = repoWithOrigin('git@gitlab.example.com:group/never-tracked.git');
-    removeFromTrackList(repo);
-    expect(fs.existsSync(configPath())).toBe(false);
+  it('removeFromTrackList：all 模式下添加到黑名单（init --local --uninstall）', () => {
+    const repo = repoWithOrigin('git@gitlab.example.com:group/to-remove.git');
+    const id = repoId(repo);
 
-    trackRepo(repo);
-    untrackRepo(repo);
+    // 第一次：添加到黑名单
+    removeFromTrackList(repo);
+    expect(fs.existsSync(configPath())).toBe(true);
+    expect(readGlobalConfig().track).toEqual({ mode: 'all', repos: [id] });
+
+    // 已经在黑名单中，再次调用应该幂等（不重复添加）
     const before = fs.readFileSync(configPath(), 'utf8');
-    removeFromTrackList(repo); // 已经不在名单中，再次调用不应改动文件
+    removeFromTrackList(repo);
     expect(fs.readFileSync(configPath(), 'utf8')).toBe(before);
+    expect(readGlobalConfig().track).toEqual({ mode: 'all', repos: [id] });
   });
 
   it('addToTrackList/removeFromTrackList 只增删名单、不改变 mode', () => {
     const repo = repoWithOrigin('git@gitlab.example.com:group/list-only.git');
-    addToTrackList(repo);
-    expect(readGlobalConfig().track).toEqual({ mode: 'all', repos: [repoId(repo)] });
+    const id = repoId(repo);
+
+    // all 模式下：removeFromTrackList 添加到黑名单
     removeFromTrackList(repo);
+    expect(readGlobalConfig().track).toEqual({ mode: 'all', repos: [id] });
+
+    // all 模式下：addToTrackList 从黑名单移除
+    addToTrackList(repo);
     expect(readGlobalConfig().track).toEqual({ mode: 'all', repos: [] });
   });
 });

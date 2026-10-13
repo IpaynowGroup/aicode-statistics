@@ -75,12 +75,12 @@ describe('planProject', () => {
 
     applyAll(planProject(repo, false));
     const afterInstall = readGlobalConfig().track as { mode: string; repos: string[] } | undefined;
-    expect(afterInstall?.mode).toBe('all'); // 仅加入名单，不改变统计模式
-    expect(afterInstall?.repos).toContain(id);
+    expect(afterInstall?.mode).toBe('all'); // 不改变统计模式
+    expect(afterInstall?.repos ?? []).not.toContain(id); // all 模式：安装从黑名单移除
 
     applyAll(planProject(repo, true));
     const afterUninstall = readGlobalConfig().track as { mode: string; repos: string[] } | undefined;
-    expect(afterUninstall?.repos ?? []).not.toContain(id);
+    expect(afterUninstall?.repos).toContain(id); // all 模式：卸载添加到黑名单
   });
 
   it('已有未跟踪的 settings.local.json 时，安装期间产生的 .aicode.bak 被 exclude 忽略；卸载后不留 .bak（见 F5）', () => {

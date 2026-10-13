@@ -93,10 +93,9 @@ aicode sync
 aicode config mysql
 
 # 管理统计名单
-aicode track          # 加入当前仓库
-aicode untrack        # 移出当前仓库
-aicode track --list   # 查看名单
-aicode track --all    # 统计所有仓库
+aicode track --list   # 查看当前配置（显示黑名单）
+aicode track          # 从黑名单移除当前仓库（重新跟踪）
+aicode untrack        # 添加当前仓库到黑名单（停止跟踪）
 ```
 
 ### 配置文件
@@ -132,6 +131,21 @@ aicode track --all    # 统计所有仓库
   }
 }
 ```
+
+#### track 配置说明
+
+- **mode: "all"** - 跟踪所有仓库（默认），`repos` 作为黑名单（不跟踪的仓库）
+
+示例：
+```json
+// 跟踪除 test-project 外的所有仓库
+{ "mode": "all", "repos": ["/path/to/test-project"] }
+
+// 不排除任何仓库（跟踪所有）
+{ "mode": "all", "repos": [] }
+```
+
+详细说明：[docs/track-quick-reference.md](docs/track-quick-reference.md)
 
 ### 环境变量
 

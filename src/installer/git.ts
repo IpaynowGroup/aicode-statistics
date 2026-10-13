@@ -22,9 +22,10 @@ const CAPTURE_LINES = [
   'REFLOG=$(git reflog -1 --format=%gs 2>/dev/null)',
   'PREV=$(git rev-parse -q --verify HEAD@{1} 2>/dev/null)',
 ];
-// 只负责用已捕获好的变量在后台启动统计，调用方需保证 CAPTURE_LINES 已在调用原 hook 之前执行过
+// 只负责用已捕获好的变量启动统计，调用方需保证 CAPTURE_LINES 已在调用原 hook 之前执行过
+// 前台同步执行，确保统计进程完成（避免 Codex 等环境下后台进程被终止）
 const launchBackgroundCommit = (commitCommand: string): string =>
-  `( ${commitCommand} --sha "$SHA" --branch "$BRANCH" --reflog "$REFLOG" --prev "$PREV" </dev/null >/dev/null 2>&1 & )`;
+  `${commitCommand} --sha "$SHA" --branch "$BRANCH" --reflog "$REFLOG" --prev "$PREV"`;
 
 // ---------- 全局模式 ----------
 

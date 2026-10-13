@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import readline from 'node:readline';
 import { runCommit } from './commit.js';
-import { globalConfigParseError, loadConfig } from './config.js';
+import { globalConfigParseError, loadConfig, readGlobalConfig } from './config.js';
 import { createTtyPrompter, defaultProbe, disableMysql, runMysqlWizard } from './configure.js';
 import { countUnreported } from './events.js';
 import { repoRoot } from './git.js';
@@ -105,9 +105,16 @@ function track(flags: string[]): number {
     console.error('当前目录不在 git 仓库中');
     return 1;
   }
+  const config = readGlobalConfig();
+  const track = config.track && typeof config.track === 'object' && 'mode' in config.track ? config.track : { mode: 'all' as const };
   const { id, switched } = trackRepo(root);
-  console.log(`已加入统计名单：${id}`);
-  if (switched) console.log('现在只统计名单中的仓库（aicode track --all 可恢复统计全部）');
+
+  if (track.mode === 'all') {
+    console.log(`已从黑名单移除：${id}（重新跟踪该仓库）`);
+  } else {
+    console.log(`已加入统计名单：${id}`);
+    if (switched) console.log('现在只统计名单中的仓库（aicode track --all 可恢复统计全部）');
+  }
   return 0;
 }
 
@@ -122,8 +129,15 @@ function untrack(flags: string[]): number {
     console.error('当前目录不在 git 仓库中');
     return 1;
   }
+  const config = readGlobalConfig();
+  const track = config.track && typeof config.track === 'object' && 'mode' in config.track ? config.track : { mode: 'all' as const };
   const { id, removed } = untrackRepo(root);
-  console.log(removed ? `已移出统计名单：${id}` : '该仓库不在名单中');
+
+  if (track.mode === 'all') {
+    console.log(removed ? `已添加到黑名单：${id}（不再跟踪该仓库）` : `该仓库已在黑名单中`);
+  } else {
+    console.log(removed ? `已移出统计名单：${id}` : '该仓库不在名单中');
+  }
   return 0;
 }
 

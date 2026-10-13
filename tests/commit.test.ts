@@ -93,16 +93,15 @@ describe('runCommit', () => {
     expect(await runCommit(process.env.HOME!)).toBeNull();
   });
 
-  it('list 模式下名单外仓库返回 null 且不写 events', async () => {
-    const other = initRepo();
-    sh(other, ['remote', 'add', 'origin', 'git@gitlab.example.com:group/other.git']);
-    const trackedRepo = initRepo();
-    sh(trackedRepo, ['remote', 'add', 'origin', 'git@gitlab.example.com:group/tracked.git']);
-    trackRepo(trackedRepo); // 切到 list 模式，other 不在名单中
+  it('黑名单内的仓库返回 null 且不写 events', async () => {
+    const repo = initRepo();
+    sh(repo, ['remote', 'add', 'origin', 'git@gitlab.example.com:group/blacklisted.git']);
+    const { untrackRepo } = await import('../src/track.js');
+    untrackRepo(repo); // 添加到黑名单
 
-    fs.writeFileSync(path.join(other, 'a.txt'), 'a\n');
-    commitAll(other, 'init');
-    expect(await runCommit(other)).toBeNull();
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
+    commitAll(repo, 'init');
+    expect(await runCommit(repo)).toBeNull();
     expect(fs.existsSync(eventsPath())).toBe(false);
   });
 });

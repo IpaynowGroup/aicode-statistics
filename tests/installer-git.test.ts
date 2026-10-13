@@ -90,10 +90,11 @@ describe('HOOK_NAMES', () => {
 });
 
 describe('全局模式', () => {
-  it('只有 post-commit 会额外在后台启动统计，且同步捕获本次 commit 的信息', () => {
+  it('只有 post-commit 会额外启动统计，且同步捕获本次 commit 的信息', () => {
     const post = renderForwarder('post-commit', null, "'node' 'cli' commit");
     expect(post).toContain('SHA=$(git rev-parse HEAD 2>/dev/null)');
-    expect(post).toContain("( 'node' 'cli' commit --sha \"$SHA\" --branch \"$BRANCH\" --reflog \"$REFLOG\" --prev \"$PREV\" </dev/null >/dev/null 2>&1 & )");
+    expect(post).toContain("'node' 'cli' commit --sha \"$SHA\" --branch \"$BRANCH\" --reflog \"$REFLOG\" --prev \"$PREV\"");
+    expect(post).not.toContain('</dev/null >/dev/null 2>&1 &'); // 前台同步执行，不再后台运行
     expect(renderForwarder('pre-commit', null, "'node' 'cli' commit")).not.toContain('commit --sha');
   });
 

@@ -215,17 +215,19 @@ describe('端到端', () => {
     const repo = initRepo();
     sh(repo, ['remote', 'add', 'origin', 'git@gitlab.example.com:group/proj.git']);
 
-    const trackResult = run(['track'], undefined, repo);
-    expect(trackResult.status).toBe(0);
-    expect(trackResult.stdout).toContain('已加入统计名单');
+    // 默认 all 模式，untrack 添加到黑名单
+    const untrackResult = run(['untrack'], undefined, repo);
+    expect(untrackResult.status).toBe(0);
+    expect(untrackResult.stdout).toContain('已添加到黑名单');
 
     const listResult = run(['track', '--list'], undefined, repo);
     expect(listResult.status).toBe(0);
     expect(listResult.stdout).toContain('gitlab.example.com/group/proj');
 
-    const untrackResult = run(['untrack'], undefined, repo);
-    expect(untrackResult.status).toBe(0);
-    expect(untrackResult.stdout).toContain('已移出统计名单');
+    // track 从黑名单移除
+    const trackResult = run(['track'], undefined, repo);
+    expect(trackResult.status).toBe(0);
+    expect(trackResult.stdout).toContain('已从黑名单移除');
 
     const listAfter = run(['track', '--list'], undefined, repo);
     expect(listAfter.stdout).not.toContain('gitlab.example.com/group/proj');
